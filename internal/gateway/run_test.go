@@ -167,6 +167,45 @@ func TestGateway_UpstreamError_Surfaced(t *testing.T) {
 	}
 }
 
+func TestGateway_ForwardsRetryAfter(t *testing.T) {
+	// Upstream 429 with Retry-After: gateway must forward the header
+	// to the client so they know how long to back off.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+	}))
+	defer upstream.Close()
+
+	addr := reservePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = gateway.Run(ctx, gateway.Config{
+			Addr:             addr,
+			ShutdownTimeout:  time.Second,
+			AnthropicAPIKey:  "test-key",
+			AnthropicBaseURL: upstream.URL,
+		})
+	}()
+	waitReady(t, "http://"+addr+"/healthz", 2*time.Second)
+
+	resp, err := http.Post("http://"+addr+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After = %q, want %q", got, "30")
+	}
+}
+
 func reservePort(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

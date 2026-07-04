@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/kevinreber/llm-gateway/internal/provider"
 )
@@ -72,6 +73,12 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var apiErr *provider.APIError
 		if errors.As(err, &apiErr) {
+			// Mirror the upstream's Retry-After when present so clients
+			// get an honest signal about backoff. Rounded down to whole
+			// seconds per RFC 7231; sub-second precision is not portable.
+			if apiErr.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(int(apiErr.RetryAfter.Seconds())))
+			}
 			// Surface the upstream status directly. This is deliberate:
 			// clients can distinguish "we did the wrong thing" (4xx) from
 			// "the upstream is unhappy" (5xx) without decoding a wrapped

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kevinreber/llm-gateway/internal/provider"
 )
@@ -187,5 +188,155 @@ func TestAnthropic_Name(t *testing.T) {
 	client := provider.NewAnthropic("test-key")
 	if client.Name() != "anthropic" {
 		t.Errorf("Name() = %q, want anthropic", client.Name())
+	}
+}
+
+func TestAnthropic_Do_MalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Truncated body — the decoder should fail cleanly, not panic.
+		_, _ = io.WriteString(w, `{"id":"msg_bad","type":"message","content":[{"type":"tex`)
+	}))
+	defer srv.Close()
+
+	client := provider.NewAnthropicWithBaseURL("test-key", srv.URL)
+	_, err := client.Do(context.Background(), &provider.Request{
+		Model:    "claude-sonnet-4-6",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("Do: want decode error, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode") {
+		t.Errorf("err = %v, want to mention 'decode'", err)
+	}
+}
+
+func TestAnthropic_Do_EmptyContentBlocks(t *testing.T) {
+	// Valid JSON but no text blocks — legitimate for a tool-use response
+	// where every block is type=tool_use. We should get an empty string,
+	// not an error, so callers can handle it themselves.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id": "msg_empty",
+			"type": "message",
+			"role": "assistant",
+			"content": [],
+			"model": "claude-sonnet-4-6",
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 1, "output_tokens": 0}
+		}`)
+	}))
+	defer srv.Close()
+
+	client := provider.NewAnthropicWithBaseURL("test-key", srv.URL)
+	resp, err := client.Do(context.Background(), &provider.Request{
+		Model:    "claude-sonnet-4-6",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if resp.Content != "" {
+		t.Errorf("Content = %q, want empty string", resp.Content)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q, want end_turn", resp.StopReason)
+	}
+}
+
+func TestAnthropic_Do_RetryAfter_Seconds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+	}))
+	defer srv.Close()
+
+	client := provider.NewAnthropicWithBaseURL("test-key", srv.URL)
+	_, err := client.Do(context.Background(), &provider.Request{
+		Model:    "claude-sonnet-4-6",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+	var apiErr *provider.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *provider.APIError", err)
+	}
+	if apiErr.RetryAfter != 42*time.Second {
+		t.Errorf("RetryAfter = %s, want 42s", apiErr.RetryAfter)
+	}
+	if !strings.Contains(apiErr.Error(), "retry-after 42s") {
+		t.Errorf("Error() = %q, want to include 'retry-after 42s'", apiErr.Error())
+	}
+}
+
+func TestAnthropic_Do_RetryAfter_HTTPDate(t *testing.T) {
+	future := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", future)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"type":"overloaded_error","message":"busy"}}`)
+	}))
+	defer srv.Close()
+
+	client := provider.NewAnthropicWithBaseURL("test-key", srv.URL)
+	_, err := client.Do(context.Background(), &provider.Request{
+		Model:    "claude-sonnet-4-6",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+	var apiErr *provider.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *provider.APIError", err)
+	}
+	// Should be roughly 90s; allow ±5s slop for the time between server-send
+	// and client-parse.
+	if d := apiErr.RetryAfter; d < 85*time.Second || d > 95*time.Second {
+		t.Errorf("RetryAfter = %s, want ~90s", d)
+	}
+}
+
+func TestAnthropic_Do_RetryAfter_Missing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+	}))
+	defer srv.Close()
+
+	client := provider.NewAnthropicWithBaseURL("test-key", srv.URL)
+	_, err := client.Do(context.Background(), &provider.Request{
+		Model:    "claude-sonnet-4-6",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+	var apiErr *provider.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *provider.APIError", err)
+	}
+	if apiErr.RetryAfter != 0 {
+		t.Errorf("RetryAfter = %s, want 0 (header missing)", apiErr.RetryAfter)
+	}
+}
+
+func TestAnthropic_Do_RetryAfter_Garbage(t *testing.T) {
+	// Unparseable Retry-After should be treated as absent, not fatal.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "not-a-real-value")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"slow"}}`)
+	}))
+	defer srv.Close()
+
+	client := provider.NewAnthropicWithBaseURL("test-key", srv.URL)
+	_, err := client.Do(context.Background(), &provider.Request{
+		Model:    "claude-sonnet-4-6",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+	var apiErr *provider.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *provider.APIError", err)
+	}
+	if apiErr.RetryAfter != 0 {
+		t.Errorf("RetryAfter = %s, want 0 (garbage header)", apiErr.RetryAfter)
 	}
 }

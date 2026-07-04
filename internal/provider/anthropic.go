@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -183,18 +184,28 @@ type anthropicContent struct {
 // APIError is a typed error returned when Anthropic responds with a
 // non-2xx status. Callers can errors.As it to inspect Status + Type
 // (for retry/breaker decisions later in Phase 3).
+//
+// RetryAfter is populated from the Retry-After response header when
+// present (429 and 503 responses set it). Zero means the upstream did
+// not advise a wait; the retry layer (Phase 3) supplies its own backoff.
 type APIError struct {
-	Provider string
-	Status   int
-	Type     string
-	Message  string
+	Provider   string
+	Status     int
+	Type       string
+	Message    string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
+	base := fmt.Sprintf("%s %d", e.Provider, e.Status)
 	if e.Type != "" {
-		return fmt.Sprintf("%s %d %s: %s", e.Provider, e.Status, e.Type, e.Message)
+		base += " " + e.Type
 	}
-	return fmt.Sprintf("%s %d: %s", e.Provider, e.Status, e.Message)
+	base += ": " + e.Message
+	if e.RetryAfter > 0 {
+		base += fmt.Sprintf(" (retry-after %s)", e.RetryAfter)
+	}
+	return base
 }
 
 // parseAnthropicError extracts the typed error body from a non-2xx
@@ -210,11 +221,38 @@ func parseAnthropicError(resp *http.Response) error {
 	}
 	_ = json.Unmarshal(body, &payload)
 	return &APIError{
-		Provider: AnthropicName,
-		Status:   resp.StatusCode,
-		Type:     payload.Error.Type,
-		Message:  payload.Error.Message,
+		Provider:   AnthropicName,
+		Status:     resp.StatusCode,
+		Type:       payload.Error.Type,
+		Message:    payload.Error.Message,
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 	}
+}
+
+// parseRetryAfter converts an HTTP Retry-After header into a duration.
+// Per RFC 7231 §7.1.3, the value is either a non-negative integer count
+// of seconds or an HTTP-date. Anthropic uses the seconds form; we
+// support both for good behavior against other providers later.
+// Unparseable or past-dated values return 0.
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(h); err == nil {
+		if n < 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
+	return 0
 }
 
 func concatTextBlocks(blocks []anthropicContent) string {
