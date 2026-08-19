@@ -54,6 +54,20 @@ func TestCents(t *testing.T) {
 			want: 0, known: false,
 		},
 		{
+			// Prefix matching must stop at a segment boundary. Without
+			// that check this billed at Sonnet 5 rates and reported as
+			// priced, so the unpriced-model warning never fired and a
+			// plausible-looking wrong number landed in the costs table.
+			name:  "near-miss model is not a prefix match",
+			model: "claude-sonnet-50", in: 1_000_000, out: 0,
+			want: 0, known: false,
+		},
+		{
+			name:  "another family's near-miss",
+			model: "claude-opus-55", in: 1_000_000, out: 0,
+			want: 0, known: false,
+		},
+		{
 			name:  "zero tokens",
 			model: "claude-sonnet-5", in: 0, out: 0,
 			want: 0, known: true,
@@ -218,6 +232,42 @@ func TestWriter_DropsAreBoundedAndCounted(t *testing.T) {
 	}
 	if sink.total() != 0 {
 		t.Errorf("sink received %d events with Run not started", sink.total())
+	}
+}
+
+// hangingSink models a database that stops responding rather than
+// failing outright: the call returns only when its context ends.
+type hangingSink struct{}
+
+func (hangingSink) InsertCosts(ctx context.Context, _ []cost.Event) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestWriter_ShutdownFlushIsBounded(t *testing.T) {
+	// The shutdown flush deliberately strips cancellation so it isn't
+	// killed the moment SIGTERM lands. Its timeout is therefore the only
+	// thing preventing a wedged database from blocking Run forever and
+	// forcing the process to be killed — which would lose the whole
+	// batch the drain exists to save.
+	w := cost.NewWriter(hangingSink{}, quietLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { w.Run(ctx); close(done) }()
+
+	w.Track(cost.Event{Model: "claude-sonnet-5"})
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return; the shutdown flush is unbounded again")
+	}
+
+	// The events are gone, but they must be gone *accountably*.
+	if got := w.Dropped(); got != 1 {
+		t.Errorf("Dropped = %d, want 1 after a timed-out shutdown flush", got)
 	}
 }
 

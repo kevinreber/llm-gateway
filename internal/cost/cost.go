@@ -82,11 +82,26 @@ func PriceFor(model string) (Price, bool) {
 		bestLen int
 	)
 	for id, p := range prices {
-		if len(id) > bestLen && strings.HasPrefix(model, id) {
+		if len(id) > bestLen && hasModelPrefix(model, id) {
 			best, bestLen = p, len(id)
 		}
 	}
 	return best, bestLen > 0
+}
+
+// hasModelPrefix reports whether model is id or a dated snapshot of it.
+//
+// The boundary check is the whole point: a bare strings.HasPrefix would
+// make any future model whose ID merely starts with a known one inherit
+// that price and report as priced, so "claude-sonnet-50" would silently
+// bill at Sonnet 5 rates with no unpriced-model warning to catch it.
+// Billing something plausible-but-wrong is worse than billing zero,
+// because nothing downstream looks wrong enough to investigate.
+func hasModelPrefix(model, id string) bool {
+	if !strings.HasPrefix(model, id) {
+		return false
+	}
+	return len(model) == len(id) || model[len(id)] == '-'
 }
 
 // Cents computes the cost of a completion in US cents. The false return

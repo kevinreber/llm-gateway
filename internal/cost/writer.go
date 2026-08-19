@@ -18,6 +18,12 @@ const (
 	// defaultInterval bounds how stale the costs table can be under
 	// light traffic.
 	defaultInterval = time.Second
+	// shutdownFlushTimeout bounds the final drain. Cancellation is
+	// stripped from that flush so it isn't killed the instant SIGTERM
+	// lands, which means this is the only thing standing between a
+	// wedged database and a process that never exits. Kept well inside
+	// the platform's kill grace period.
+	shutdownFlushTimeout = 5 * time.Second
 )
 
 // Writer batches cost events and hands them to a Sink on a fixed
@@ -81,6 +87,14 @@ func (w *Writer) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Detach from the cancelled context so the final write isn't
+			// killed on arrival, but keep a deadline: a database that
+			// hangs rather than fails would otherwise block Run forever
+			// and the process would have to be killed, losing exactly
+			// the events this drain exists to save.
+			flushCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx), shutdownFlushTimeout)
+
 			// Pull everything already buffered. Producers are gone by
 			// now (the HTTP server drained first), so this terminates.
 			for {
@@ -88,14 +102,16 @@ func (w *Writer) Run(ctx context.Context) {
 				case e := <-w.ch:
 					batch = append(batch, e)
 					if len(batch) >= w.maxBatch {
-						batch = w.flush(context.WithoutCancel(ctx), batch)
+						batch = w.flush(flushCtx, batch)
 					}
 					continue
 				default:
 				}
 				break
 			}
-			w.flush(context.WithoutCancel(ctx), batch)
+			w.flush(flushCtx, batch)
+			cancel()
+
 			if n := w.dropped.Load(); n > 0 {
 				w.logger.Warn("cost events dropped", "count", n)
 			}

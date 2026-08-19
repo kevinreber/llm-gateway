@@ -126,15 +126,49 @@ func newHarness(t *testing.T, yaml string) *harness {
 
 	return &harness{
 		h: &handler{
-			providers: map[string]provider.Provider{provider.AnthropicName: fp},
-			cfg:       cfg,
-			limiter:   fl,
-			costs:     rt,
-			logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			providers:     map[string]provider.Provider{provider.AnthropicName: fp},
+			providerOrder: []string{provider.AnthropicName},
+			cfg:           cfg,
+			limiter:       fl,
+			costs:         rt,
+			logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		},
 		provider: fp,
 		limiter:  fl,
 		costs:    rt,
+	}
+}
+
+func TestResolve_DirectModelIsDeterministic(t *testing.T) {
+	// Two providers both claiming the same model is the situation that
+	// arrives with Ollama and a hosted mirror. Ranging the provider map
+	// would pick a winner per request at random; the explicit order has
+	// to win every time, or cost attribution and latency become
+	// irreproducible in a way no test would catch.
+	first := &fakeProvider{name: "first", supports: func(string) bool { return true }}
+	second := &fakeProvider{name: "second", supports: func(string) bool { return true }}
+
+	h := &handler{
+		providers: map[string]provider.Provider{
+			"first":  first,
+			"second": second,
+		},
+		providerOrder: []string{"first", "second"},
+		cfg:           &config.Config{},
+		limiter:       ratelimit.AllowAll{},
+		costs:         &recordingTracker{},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	for i := 0; i < 100; i++ {
+		rt, err := h.resolve("claude-sonnet-5")
+		if err != nil {
+			t.Fatalf("iteration %d: resolve: %v", i, err)
+		}
+		if rt.provider.Name() != "first" {
+			t.Fatalf("iteration %d: resolved to %q, want the first provider in order",
+				i, rt.provider.Name())
+		}
 	}
 }
 
@@ -355,6 +389,27 @@ func TestMessages_BillsTheModelThatServed(t *testing.T) {
 	// Haiku rates, not Sonnet's: 1000 in at $1 + 500 out at $5 = 0.35c.
 	if math.Abs(events[0].CostCents-0.35) > 1e-9 {
 		t.Errorf("CostCents = %v, want 0.35 (Haiku rates)", events[0].CostCents)
+	}
+}
+
+func TestMessages_UpstreamRetryAfterRoundsUp(t *testing.T) {
+	// A sub-second upstream Retry-After must not truncate to 0 — that
+	// tells an already-throttled client to retry immediately, which is
+	// the opposite of what the upstream asked for.
+	hn := newHarness(t, aliasYAML)
+	hn.provider.err = &provider.APIError{
+		Provider: "anthropic", Status: http.StatusTooManyRequests,
+		Type: "rate_limit_error", Message: "slow down",
+		RetryAfter: 400 * time.Millisecond,
+	}
+
+	rec := hn.post(t, `{"model":"smart",`+userTurn+`}`)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want 1 (rounded up from 400ms)", got)
 	}
 }
 

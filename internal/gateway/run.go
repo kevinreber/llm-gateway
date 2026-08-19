@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -26,6 +27,11 @@ import (
 // this path is not an error — it means "run with no aliases and no rate
 // limits", which is a valid single-provider deployment.
 const defaultConfigPath = "gateway.yaml"
+
+// startupDBTimeout bounds connecting to Postgres and applying
+// migrations. Generous enough for a cold pool and a real migration,
+// short enough that a bad DATABASE_URL fails the deploy quickly.
+const startupDBTimeout = 15 * time.Second
 
 // Config is the runtime configuration for the gateway. Populate it
 // yourself in tests; use LoadConfigFromEnv in production.
@@ -115,12 +121,14 @@ func Run(ctx context.Context, cfg Config) error {
 		writerDone.Wait()
 	}()
 
+	providers, order := buildProviders(cfg)
 	h := &handler{
-		providers: buildProviders(cfg),
-		cfg:       gwCfg,
-		limiter:   limiter,
-		costs:     writer,
-		logger:    logger,
+		providers:     providers,
+		providerOrder: order,
+		cfg:           gwCfg,
+		limiter:       limiter,
+		costs:         writer,
+		logger:        logger,
 	}
 
 	srv := &http.Server{
@@ -171,7 +179,11 @@ func loadGatewayConfig(path string, logger *slog.Logger) (*config.Config, error)
 		logger.Info("loaded gateway config", "path", path)
 		return cfg, nil
 	}
-	if explicit || !os.IsNotExist(errors.Unwrap(err)) {
+	// errors.Is walks the whole chain; a single Unwrap would silently
+	// flip this check the moment another layer of context is added to
+	// the error, turning a tolerated missing default into a hard boot
+	// failure (or the reverse).
+	if explicit || !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	logger.Info("no gateway config found; serving direct model names with no rate limits",
@@ -179,14 +191,20 @@ func loadGatewayConfig(path string, logger *slog.Logger) (*config.Config, error)
 	return &config.Config{}, nil
 }
 
-func buildProviders(cfg Config) map[string]provider.Provider {
+// buildProviders returns the provider registry and the order in which
+// they are tried for a direct (non-alias) model name. The order is
+// explicit rather than derived from the map so that adding a provider is
+// a deliberate decision about precedence, not an accident of hashing.
+func buildProviders(cfg Config) (map[string]provider.Provider, []string) {
 	anth := provider.NewAnthropic(cfg.AnthropicAPIKey)
 	if cfg.AnthropicBaseURL != "" {
 		anth = provider.NewAnthropicWithBaseURL(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL)
 	}
 	return map[string]provider.Provider{
-		provider.AnthropicName: anth,
-	}
+			provider.AnthropicName: anth,
+		}, []string{
+			provider.AnthropicName,
+		}
 }
 
 func buildLimiter(addrs []string, logger *slog.Logger) (ratelimit.Limiter, error) {
@@ -211,11 +229,19 @@ func buildCostSink(ctx context.Context, dsn string, logger *slog.Logger) (cost.S
 		return cost.LogSink{Logger: logger}, func() {}, nil
 	}
 
-	pg, err := store.Open(ctx, dsn)
+	// Bound startup database work. Without a deadline an unreachable
+	// Postgres falls through to the OS TCP timeout — minutes on Linux —
+	// and the gateway hangs in boot with no listener bound and nothing
+	// in the log to explain it. Failing fast and loudly is far easier to
+	// diagnose than a deploy that silently stalls.
+	startCtx, cancel := context.WithTimeout(ctx, startupDBTimeout)
+	defer cancel()
+
+	pg, err := store.Open(startCtx, dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cost store: %w", err)
 	}
-	if err := pg.Migrate(ctx); err != nil {
+	if err := pg.Migrate(startCtx); err != nil {
 		pg.Close()
 		return nil, nil, fmt.Errorf("migrate: %w", err)
 	}

@@ -27,10 +27,17 @@ const maxRequestBytes = 1 << 20 // 1 MiB
 // circuit-breaker fallback between resolution and the provider call.
 type handler struct {
 	providers map[string]provider.Provider
-	cfg       *config.Config
-	limiter   ratelimit.Limiter
-	costs     cost.Tracker
-	logger    *slog.Logger
+	// providerOrder fixes the order resolve() tries providers when the
+	// caller names a concrete model. Ranging the map directly would be
+	// nondeterministic per request, so once two providers can serve
+	// overlapping model names (a local Ollama mirror and a hosted one,
+	// say) identical requests would route differently with no way to
+	// reproduce it.
+	providerOrder []string
+	cfg           *config.Config
+	limiter       ratelimit.Limiter
+	costs         cost.Tracker
+	logger        *slog.Logger
 }
 
 // route is the outcome of resolving a client-supplied model name.
@@ -133,8 +140,8 @@ func (h *handler) resolve(name string) (route, error) {
 		return route{alias: name, provider: p, model: alias.Model}, nil
 	}
 
-	for _, p := range h.providers {
-		if p.Supports(name) {
+	for _, providerName := range h.providerOrder {
+		if p := h.providers[providerName]; p != nil && p.Supports(name) {
 			return route{provider: p, model: name}, nil
 		}
 	}
@@ -172,6 +179,16 @@ func (h *handler) allow(ctx context.Context, w http.ResponseWriter, rt route) bo
 	if verdict.Allowed {
 		return true
 	}
+
+	// Debug rather than Warn: for a busy alias, denial is the steady
+	// state, and logging every one at Warn would flood under exactly the
+	// load that makes the log worth reading. This exists so shed traffic
+	// is diagnosable at all today; the denial counter in the metrics
+	// work is the real answer.
+	h.logger.Debug("rate limit denied",
+		"alias", rt.alias,
+		"retry_after", verdict.RetryAfter,
+		"remaining", verdict.Remaining)
 
 	if verdict.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(secondsCeil(verdict.RetryAfter)))
@@ -213,11 +230,13 @@ func (h *handler) trackCost(rt route, resp *provider.Response) {
 func (h *handler) writeProviderError(w http.ResponseWriter, rt route, err error) {
 	var apiErr *provider.APIError
 	if errors.As(err, &apiErr) {
-		// Mirror the upstream's Retry-After when present so clients
-		// get an honest signal about backoff. Rounded down to whole
-		// seconds per RFC 7231; sub-second precision is not portable.
+		// Mirror the upstream's Retry-After when present so clients get
+		// an honest signal about backoff. Whole seconds per RFC 7231,
+		// rounded up for the same reason as the rate-limit path: a
+		// sub-second wait truncated to 0 tells an already-throttled
+		// client to retry immediately.
 		if apiErr.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(apiErr.RetryAfter.Seconds())))
+			w.Header().Set("Retry-After", strconv.Itoa(secondsCeil(apiErr.RetryAfter)))
 		}
 		// Surface the upstream status directly. This is deliberate:
 		// clients can distinguish "we did the wrong thing" (4xx) from

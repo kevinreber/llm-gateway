@@ -52,6 +52,15 @@ func (p *Postgres) Close() { p.pool.Close() }
 // row is inserted with ON CONFLICT DO NOTHING and the migration only
 // runs if that insert claimed the version. A replica that loses the race
 // skips the file rather than replaying a CREATE TABLE.
+//
+// The claim must stay inside the same transaction as the migration body.
+// That is what makes all three interleavings correct: if the winner
+// commits, the loser's insert conflicts and affects zero rows; if the
+// winner aborts, the loser's insert succeeds and it runs the migration;
+// and if they race, Postgres blocks the loser's ON CONFLICT insert on
+// the winner's uncommitted row until it resolves, so the loser always
+// observes a settled outcome instead of racing on CREATE TABLE. Moving
+// the claim out of the transaction breaks all of that.
 func (p *Postgres) Migrate(ctx context.Context) error {
 	if _, err := p.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
