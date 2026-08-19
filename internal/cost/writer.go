@@ -18,6 +18,12 @@ const (
 	// defaultInterval bounds how stale the costs table can be under
 	// light traffic.
 	defaultInterval = time.Second
+	// flushTimeout bounds one batch write during normal operation.
+	// Without it a single wedged call blocks every later batch for as
+	// long as it hangs, turning a transient database stall into a total
+	// cost-accounting outage that only ends at shutdown. With it we lose
+	// one batch, count it, and carry on.
+	flushTimeout = 10 * time.Second
 	// shutdownFlushTimeout bounds the final drain. Cancellation is
 	// stripped from that flush so it isn't killed the instant SIGTERM
 	// lands, which means this is the only thing standing between a
@@ -120,13 +126,24 @@ func (w *Writer) Run(ctx context.Context) {
 		case e := <-w.ch:
 			batch = append(batch, e)
 			if len(batch) >= w.maxBatch {
-				batch = w.flush(ctx, batch)
+				batch = w.flushBounded(ctx, batch)
 			}
 
 		case <-tick.C:
-			batch = w.flush(ctx, batch)
+			batch = w.flushBounded(ctx, batch)
 		}
 	}
+}
+
+// flushBounded is flush with a per-write deadline, used on the steady-
+// state path so one hung call cannot stall every batch behind it.
+func (w *Writer) flushBounded(ctx context.Context, batch []Event) []Event {
+	if len(batch) == 0 {
+		return batch
+	}
+	flushCtx, cancel := context.WithTimeout(ctx, flushTimeout)
+	defer cancel()
+	return w.flush(flushCtx, batch)
 }
 
 // flush writes the batch and returns it truncated for reuse. A failed

@@ -135,6 +135,13 @@ func Run(ctx context.Context, cfg Config) error {
 		Addr:              cfg.Addr,
 		Handler:           h.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// WriteTimeout sits above the provider's own 60s client timeout
+		// so a legitimately slow completion is never cut off, while a
+		// client that stops reading still has its connection reclaimed.
+		// Streaming responses (Phase 5) will need this reconsidered —
+		// an SSE completion can outlive any fixed write deadline.
+		WriteTimeout: 90 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)

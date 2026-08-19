@@ -316,6 +316,38 @@ func TestMessages_AliasWithoutLimitIsUnlimited(t *testing.T) {
 	}
 }
 
+// blockingLimiter models a bucketd node that is slow rather than down.
+type blockingLimiter struct{}
+
+func (blockingLimiter) Allow(ctx context.Context, _ string, _ ratelimit.Limit) (ratelimit.Verdict, error) {
+	<-ctx.Done()
+	return ratelimit.Verdict{}, ctx.Err()
+}
+
+func (blockingLimiter) Close() error { return nil }
+
+func TestMessages_SlowLimiterDoesNotStallTheRequest(t *testing.T) {
+	// A degraded limiter must stop mattering, not become the slowest
+	// thing in the request path. Without a bound on the Allow call this
+	// request would hang for as long as the client was willing to wait.
+	hn := newHarness(t, aliasYAML)
+	hn.h.limiter = blockingLimiter{}
+
+	start := time.Now()
+	rec := hn.post(t, `{"model":"smart",`+userTurn+`}`)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail open); body = %s", rec.Code, rec.Body)
+	}
+	if hn.provider.calls != 1 {
+		t.Errorf("provider called %d times, want 1", hn.provider.calls)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("request took %s — the limiter call is unbounded", elapsed)
+	}
+}
+
 func TestMessages_LimiterErrorFailsOpen(t *testing.T) {
 	// A bucketd outage degrades enforcement; it must not take the
 	// gateway's traffic down with it.

@@ -23,6 +23,15 @@ import (
 // a bug or an abuse attempt.
 const maxRequestBytes = 1 << 20 // 1 MiB
 
+// limiterTimeout bounds the rate-limit check.
+//
+// Without it a bucketd node that is slow rather than down would stall
+// the request for as long as the client waits, which inverts the whole
+// point of the fail-open policy: a degraded limiter is supposed to stop
+// mattering, not become the slowest thing in the request path. On
+// timeout we take the fail-open branch and serve.
+const limiterTimeout = 250 * time.Millisecond
+
 // handler owns the HTTP routes for the gateway. Phase 3 adds retry and
 // circuit-breaker fallback between resolution and the provider call.
 type handler struct {
@@ -167,7 +176,10 @@ func (h *handler) allow(ctx context.Context, w http.ResponseWriter, rt route) bo
 		return true
 	}
 
-	verdict, err := h.limiter.Allow(ctx, "alias:"+rt.alias, ratelimit.Limit{
+	limitCtx, cancel := context.WithTimeout(ctx, limiterTimeout)
+	defer cancel()
+
+	verdict, err := h.limiter.Allow(limitCtx, "alias:"+rt.alias, ratelimit.Limit{
 		Capacity:   limit.Capacity,
 		RefillRate: limit.RefillRate,
 	})

@@ -26,15 +26,26 @@ type Postgres struct {
 // Open parses the DSN, opens a pool, and verifies connectivity before
 // returning. Failing here rather than on first query means a bad
 // DATABASE_URL surfaces at startup instead of on a user's request.
+//
+// ctx bounds the connectivity check only. It is deliberately NOT the
+// pool's own context: pgxpool hands the context it is constructed with
+// to a background goroutine that pre-warms idle connections, so passing
+// a startup deadline here would cancel that pre-warm as soon as the
+// deadline was cleaned up. That is invisible today because the pool
+// defaults to zero minimum connections, and would quietly break the
+// moment someone set pool_min_conns in the DSN.
 func Open(ctx context.Context, dsn string) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
 	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	pool, err := pgxpool.NewWithConfig(context.WithoutCancel(ctx), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pool: %w", err)
 	}
+	// Ping honours ctx, so this is what actually enforces the startup
+	// deadline — pgxpool connects lazily and NewWithConfig does not
+	// touch the network.
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
