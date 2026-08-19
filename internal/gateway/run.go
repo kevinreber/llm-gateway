@@ -250,6 +250,20 @@ func buildProviders(cfg Config, gwCfg *config.Config, logger *slog.Logger) (map[
 			opts.FailureThreshold = b.FailureThreshold
 			opts.RecoveryTimeout = b.RecoveryTimeout
 		}
+		// A breaker that opens silently is a provider that disappears
+		// silently: the request-path logs only show the consequences, on
+		// the next request, and only when no fallback absorbed them.
+		// This is the one line that makes "when did anthropic go away"
+		// answerable. Phase 4's metrics hang off the same hook.
+		name := p.Name()
+		opts.OnStateChange = func(from, to resilience.State) {
+			level := slog.LevelInfo
+			if to == resilience.StateOpen {
+				level = slog.LevelWarn
+			}
+			logger.Log(context.Background(), level, "circuit breaker state change",
+				"provider", name, "from", from.String(), "to", to.String())
+		}
 		wrapped := resilience.Wrap(p, opts)
 		providers[p.Name()] = wrapped
 		order = append(order, p.Name())

@@ -100,6 +100,11 @@ type Breaker struct {
 	// test nobody runs.
 	now func() time.Time
 
+	// onStateChange is fired outside the lock on every transition. Set
+	// once at construction and never mutated, so reading it unlocked is
+	// safe.
+	onStateChange func(from, to State)
+
 	mu       sync.RWMutex
 	state    State
 	failures int
@@ -114,7 +119,10 @@ type Breaker struct {
 // NewBreaker returns a closed breaker. A threshold or recovery timeout
 // at or below zero falls back to the package default rather than
 // producing a breaker that trips instantly or never closes again.
-func NewBreaker(name string, threshold int, recovery time.Duration) *Breaker {
+//
+// onStateChange may be nil. When set it is called on every transition,
+// outside the lock — see notify.
+func NewBreaker(name string, threshold int, recovery time.Duration, onStateChange func(from, to State)) *Breaker {
 	if threshold <= 0 {
 		threshold = DefaultFailureThreshold
 	}
@@ -122,12 +130,28 @@ func NewBreaker(name string, threshold int, recovery time.Duration) *Breaker {
 		recovery = DefaultRecoveryTimeout
 	}
 	return &Breaker{
-		name:      name,
-		threshold: threshold,
-		recovery:  recovery,
-		now:       time.Now,
-		state:     StateClosed,
+		name:          name,
+		threshold:     threshold,
+		recovery:      recovery,
+		now:           time.Now,
+		onStateChange: onStateChange,
+		state:         StateClosed,
 	}
+}
+
+// notify fires the state-change hook, and only on a real transition.
+//
+// Called after the lock is released, never while holding it. The hook is
+// arbitrary caller code — a log write, a metric export — and running it
+// under the write lock would put it in the path of every other
+// goroutine's state check, which is the one thing the RWMutex fast path
+// exists to avoid. A hook that touched this breaker would deadlock
+// outright.
+func (b *Breaker) notify(from, to State) {
+	if from == to || b.onStateChange == nil {
+		return
+	}
+	b.onStateChange(from, to)
 }
 
 // Allow reports whether a call may proceed. A nil return means go; an
@@ -135,9 +159,16 @@ func NewBreaker(name string, threshold int, recovery time.Duration) *Breaker {
 // called.
 //
 // A caller that gets nil back MUST report the outcome with exactly one
-// of RecordSuccess or RecordFailure. Skipping it leaks the half-open
-// probe slot, and the breaker would then sit in half-open refusing every
-// request until the process restarts.
+// of RecordSuccess, RecordFailure, or RecordIndeterminate. Skipping it
+// leaks the half-open probe slot, and the breaker then sits in half-open
+// refusing every request until the process restarts.
+//
+// RecordIndeterminate exists because that rule is easy to break: the
+// interesting outcomes are not just "worked" and "the provider is
+// broken". A 400 and a client that hung up are neither, and a caller
+// with no third option tends to report nothing at all — which is exactly
+// how the slot leaked. See Provider.attemptOnce for the defer that makes
+// honoring this structural rather than a rule to remember.
 func (b *Breaker) Allow() error {
 	b.mu.RLock()
 	closed := b.state == StateClosed
@@ -154,40 +185,43 @@ func (b *Breaker) Allow() error {
 // have transitioned between the RUnlock above and this Lock.
 func (b *Breaker) allowSlow() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	from := b.state
+	var err error
 
 	switch b.state {
 	case StateClosed:
-		return nil
 
 	case StateOpen:
 		elapsed := b.now().Sub(b.openedAt)
 		if elapsed < b.recovery {
-			return &OpenError{Provider: b.name, RetryAfter: b.recovery - elapsed}
+			err = &OpenError{Provider: b.name, RetryAfter: b.recovery - elapsed}
+			break
 		}
 		b.state = StateHalfOpen
 		b.probing = true
-		return nil
 
 	case StateHalfOpen:
 		if b.probing {
 			// Someone else is already testing the water. Reject without
 			// a wait hint we can't honestly compute — we don't know how
 			// long that probe will take.
-			return &OpenError{Provider: b.name, RetryAfter: b.recovery}
+			err = &OpenError{Provider: b.name, RetryAfter: b.recovery}
+			break
 		}
 		b.probing = true
-		return nil
-
-	default:
-		return nil
 	}
+
+	to := b.state
+	b.mu.Unlock()
+
+	b.notify(from, to)
+	return err
 }
 
 // RecordSuccess reports that a call allowed by this breaker succeeded.
 func (b *Breaker) RecordSuccess() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	from := b.state
 
 	switch b.state {
 	case StateHalfOpen:
@@ -202,6 +236,30 @@ func (b *Breaker) RecordSuccess() {
 		// evidence about a provider we have since decided is unhealthy,
 		// so it does not get to reopen the gate early.
 	}
+
+	to := b.state
+	b.mu.Unlock()
+
+	b.notify(from, to)
+}
+
+// RecordIndeterminate reports that a call allowed by this breaker
+// finished without evidence either way: a 4xx the provider was right to
+// refuse, a 429 asking us to slow down, or a caller that hung up.
+//
+// It frees the half-open probe slot without voting on health, which is
+// the whole reason it exists. Neither neighbour would do: RecordSuccess
+// resets the consecutive-failure count, so a burst of 429s would erase
+// the record of the 5xx that preceded them, and RecordFailure would
+// blame a provider that did nothing wrong — a malformed prompt from one
+// caller would eventually take the provider out of rotation for
+// everyone.
+//
+// This never transitions state, so there is nothing to notify.
+func (b *Breaker) RecordIndeterminate() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.probing = false
 }
 
 // RecordFailure reports that a call allowed by this breaker failed in a
@@ -210,7 +268,7 @@ func (b *Breaker) RecordSuccess() {
 // of the request, not of the provider.
 func (b *Breaker) RecordFailure() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	from := b.state
 
 	switch b.state {
 	case StateClosed:
@@ -227,6 +285,11 @@ func (b *Breaker) RecordFailure() {
 		// in-flight stragglers would push recovery out indefinitely
 		// under load.
 	}
+
+	to := b.state
+	b.mu.Unlock()
+
+	b.notify(from, to)
 }
 
 // trip moves the breaker to open. Caller must hold the write lock.

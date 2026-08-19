@@ -32,7 +32,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 func newTestBreaker(threshold int, recovery time.Duration) (*Breaker, *fakeClock) {
 	clock := newClock()
-	b := NewBreaker("test", threshold, recovery)
+	b := NewBreaker("test", threshold, recovery, nil)
 	b.now = clock.Now
 	return b, clock
 }
@@ -254,7 +254,7 @@ func TestBreaker_ConcurrentUse(t *testing.T) {
 func TestBreaker_ZeroValuesTakeDefaults(t *testing.T) {
 	// A breaker built from an unset config must not trip instantly or
 	// stay open forever.
-	b := NewBreaker("test", 0, 0)
+	b := NewBreaker("test", 0, 0, nil)
 	if b.threshold != DefaultFailureThreshold {
 		t.Errorf("threshold = %d, want %d", b.threshold, DefaultFailureThreshold)
 	}

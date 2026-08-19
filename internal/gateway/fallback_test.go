@@ -265,6 +265,67 @@ func TestFallback_ClientErrorsDoNotWalkTheChain(t *testing.T) {
 	}
 }
 
+func TestFallback_ExpiredPrimaryKeyFailsOver(t *testing.T) {
+	// A rotated or expired API key is the incident automatic failover
+	// exists to absorb: the caller's request is fine, the gateway's own
+	// credential is not, and a second provider with working credentials
+	// is sitting right there. This used to return 401 to every caller
+	// with the fallback provider untouched, because 401 was classified
+	// alongside 400 as "a refusal every vendor would repeat".
+	hn := newFallbackHarness(t, noRetry())
+	hn.anth.err = &provider.APIError{
+		Provider: "anthropic",
+		Status:   401,
+		Type:     "authentication_error",
+		Message:  "invalid x-api-key",
+	}
+	hn.openai.resp = &provider.Response{Content: "x", Model: "gpt-4o"}
+
+	rec := hn.post(t, "smart")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body)
+	}
+	if hn.openai.calls != 1 {
+		t.Errorf("openai calls = %d, want 1", hn.openai.calls)
+	}
+	if got := rec.Header().Get("X-Gateway-Provider"); got != "openai" {
+		t.Errorf("X-Gateway-Provider = %q, want openai", got)
+	}
+	// One attempt only. The key will not fix itself between retries, so
+	// spending the request's budget on two more identical 401s would
+	// just delay the fallback.
+	if hn.anth.calls != 1 {
+		t.Errorf("anthropic calls = %d, want 1 — a 401 must not be retried", hn.anth.calls)
+	}
+}
+
+func TestFallback_RepeatedAuthFailuresOpenTheBreaker(t *testing.T) {
+	// The other half: a provider we cannot authenticate to should stop
+	// receiving traffic entirely, not pay a round trip per request
+	// forever.
+	opts := noRetry()
+	opts.FailureThreshold = 2
+	opts.RecoveryTimeout = time.Hour
+	hn := newFallbackHarness(t, opts)
+	hn.anth.err = &provider.APIError{Provider: "anthropic", Status: 401, Message: "invalid x-api-key"}
+	hn.openai.resp = &provider.Response{Content: "x", Model: "gpt-4o"}
+
+	for i := range 5 {
+		if rec := hn.post(t, "smart"); rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i, rec.Code)
+		}
+	}
+
+	if got := hn.brk[provider.AnthropicName].State(); got != resilience.StateOpen {
+		t.Errorf("anthropic breaker = %v, want open", got)
+	}
+	if hn.anth.calls > 2 {
+		t.Errorf("anthropic called %d times across 5 requests; the breaker should have stopped it at 2",
+			hn.anth.calls)
+	}
+}
+
 func TestFallback_ExhaustedChainReportsThePrimaryFailure(t *testing.T) {
 	// The client asked for `smart`. Why *smart* could not be served is
 	// the answer to their question; the other hops are in the log.

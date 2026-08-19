@@ -27,6 +27,11 @@ type Options struct {
 	// combined. It is what stops "three attempts" from meaning "three
 	// times the single-attempt worst case".
 	Budget time.Duration
+	// OnStateChange is called on every breaker transition, outside the
+	// breaker's lock. Optional. Phase 4's metrics hang off the same
+	// hook; today it is what makes an opening circuit visible at all,
+	// since the alternative is inferring it from the handler's 503s.
+	OnStateChange func(from, to State)
 }
 
 func (o Options) withDefaults() Options {
@@ -79,7 +84,7 @@ func Wrap(p provider.Provider, opts Options) *Provider {
 	opts = opts.withDefaults()
 	return &Provider{
 		inner:          p,
-		breaker:        NewBreaker(p.Name(), opts.FailureThreshold, opts.RecoveryTimeout),
+		breaker:        NewBreaker(p.Name(), opts.FailureThreshold, opts.RecoveryTimeout, opts.OnStateChange),
 		maxAttempts:    opts.MaxAttempts,
 		baseBackoff:    opts.BaseBackoff,
 		maxBackoff:     opts.MaxBackoff,
@@ -123,7 +128,8 @@ func (p *Provider) Do(ctx context.Context, req *provider.Request) (*provider.Res
 
 	var lastErr error
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		if err := p.breaker.Allow(); err != nil {
+		resp, err, allowed := p.attemptOnce(ctx, budgetCtx, req)
+		if !allowed {
 			if lastErr != nil {
 				// The breaker opened partway through our own retries.
 				// Report the failure that caused it, not the symptom —
@@ -133,31 +139,18 @@ func (p *Provider) Do(ctx context.Context, req *provider.Request) (*provider.Res
 			}
 			return nil, err
 		}
-
-		attemptCtx, cancelAttempt := context.WithTimeout(budgetCtx, p.attemptTimeout)
-		resp, err := p.inner.Do(attemptCtx, req)
-		cancelAttempt()
-
 		if err == nil {
-			p.breaker.RecordSuccess()
 			return resp, nil
 		}
 
 		// The caller's context — the client's connection, or the
 		// gateway-wide call budget — is gone. There is nothing left to
-		// retry into, and the provider is not to blame for a client that
-		// hung up, so this is not recorded against its health. An
-		// attempt deadline firing while ctx is still live is a different
-		// thing entirely and falls through to classify below, where it
-		// counts as the provider being too slow.
+		// retry into.
 		if ctx.Err() != nil {
 			return nil, err
 		}
 
-		retry, unhealthy := classify(err)
-		if unhealthy {
-			p.breaker.RecordFailure()
-		}
+		retry, _ := classify(err)
 		lastErr = err
 
 		if !retry || attempt == p.maxAttempts {
@@ -175,4 +168,52 @@ func (p *Provider) Do(ctx context.Context, req *provider.Request) (*provider.Res
 		}
 	}
 	return nil, lastErr
+}
+
+// attemptOnce makes one breaker-guarded call to the provider. The
+// allowed return reports whether the breaker let it through at all; when
+// false, err is the breaker's own rejection and no call was made.
+//
+// This is a separate function so the breaker outcome can be reported by
+// defer instead of at each return in the retry loop. That is not a
+// stylistic preference. The previous version recorded inline and missed
+// two of its paths — a non-unhealthy error such as a 400 or a 429, and a
+// caller whose context had expired — so a half-open probe that hit
+// either one claimed the probe slot and never released it. The breaker
+// then sat in half-open rejecting every subsequent request forever,
+// because nothing could reach the provider to report an outcome and
+// clear it. One 400 landing on one probe bricked the provider until the
+// process restarted.
+//
+// Defaulting to indeterminate and letting defer fire means a future
+// early return cannot reintroduce that, and a panic inside the inner
+// provider releases the slot on the way out too.
+func (p *Provider) attemptOnce(parent, budgetCtx context.Context, req *provider.Request) (*provider.Response, error, bool) {
+	if err := p.breaker.Allow(); err != nil {
+		return nil, err, false
+	}
+
+	report := p.breaker.RecordIndeterminate
+	defer func() { report() }()
+
+	attemptCtx, cancel := context.WithTimeout(budgetCtx, p.attemptTimeout)
+	defer cancel()
+
+	resp, err := p.inner.Do(attemptCtx, req)
+	switch {
+	case err == nil:
+		report = p.breaker.RecordSuccess
+	case parent.Err() != nil:
+		// The caller went away or the gateway-wide budget is spent.
+		// Neither is the provider's fault, so its record is untouched —
+		// but the probe slot still has to come back. An attempt deadline
+		// firing while the parent is still live is a different thing
+		// entirely and falls through to classify below, where it counts
+		// as the provider being too slow.
+	default:
+		if _, unhealthy := classify(err); unhealthy {
+			report = p.breaker.RecordFailure
+		}
+	}
+	return resp, err, true
 }

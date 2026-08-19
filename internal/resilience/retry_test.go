@@ -117,7 +117,14 @@ func TestClassify(t *testing.T) {
 		},
 		{"408", apiErr(408, 0), true, true},
 		{"400", apiErr(400, 0), false, false},
-		{"401", apiErr(401, 0), false, false},
+		{
+			// Not a bad request, a bad credential — and ours, not the
+			// caller's. Nothing to retry, because the key will not fix
+			// itself between attempts, but a provider we cannot
+			// authenticate to is unusable and has to leave the rotation.
+			"401 does not retry but is unhealthy", apiErr(401, 0), false, true,
+		},
+		{"403 likewise", apiErr(403, 0), false, true},
 		{"404", apiErr(404, 0), false, false},
 		{"413 context too long", apiErr(413, 0), false, false},
 		{
@@ -156,7 +163,13 @@ func TestShouldFallback(t *testing.T) {
 		{"500", apiErr(500, 0), true},
 		{"429", apiErr(429, 0), true},
 		{"400 fails the same way everywhere", apiErr(400, 0), false},
-		{"401", apiErr(401, 0), false},
+		{
+			// The case that proved deriving this from retry alone was
+			// wrong: an expired key is not retryable, yet a healthy
+			// second provider is exactly what should serve this.
+			"401 escapes to another provider", apiErr(401, 0), true,
+		},
+		{"403 likewise", apiErr(403, 0), true},
 		{"invalid request", fmt.Errorf("%w: nope", provider.ErrInvalidRequest), false},
 	}
 	for _, tc := range tests {
@@ -493,18 +506,30 @@ func TestProvider_HealthIgnoresTheBreaker(t *testing.T) {
 }
 
 func TestOptions_ZeroValueIsUsable(t *testing.T) {
+	// Compared field by field rather than with ==: Options carries an
+	// OnStateChange func, so the struct is no longer comparable.
 	got := Options{}.withDefaults()
-	want := Options{
-		FailureThreshold: DefaultFailureThreshold,
-		RecoveryTimeout:  DefaultRecoveryTimeout,
-		MaxAttempts:      DefaultMaxAttempts,
-		BaseBackoff:      DefaultBaseBackoff,
-		MaxBackoff:       DefaultMaxBackoff,
-		AttemptTimeout:   DefaultAttemptTimeout,
-		Budget:           DefaultBudget,
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"FailureThreshold", got.FailureThreshold, DefaultFailureThreshold},
+		{"RecoveryTimeout", got.RecoveryTimeout, DefaultRecoveryTimeout},
+		{"MaxAttempts", got.MaxAttempts, DefaultMaxAttempts},
+		{"BaseBackoff", got.BaseBackoff, DefaultBaseBackoff},
+		{"MaxBackoff", got.MaxBackoff, DefaultMaxBackoff},
+		{"AttemptTimeout", got.AttemptTimeout, DefaultAttemptTimeout},
+		{"Budget", got.Budget, DefaultBudget},
 	}
-	if got != want {
-		t.Errorf("withDefaults() = %+v, want %+v", got, want)
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("withDefaults().%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	// A nil hook must survive as nil rather than becoming a stub, since
+	// notify's nil check is what keeps the no-hook path free.
+	if got.OnStateChange != nil {
+		t.Error("withDefaults() invented an OnStateChange hook")
 	}
 }
 

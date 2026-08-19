@@ -90,10 +90,23 @@ func classify(err error) (retry, unhealthy bool) {
 			return true, false
 		case apiErr.Status == http.StatusRequestTimeout:
 			return true, true
+		case apiErr.Status == http.StatusUnauthorized,
+			apiErr.Status == http.StatusForbidden:
+			// Not a bad request — a bad credential, and the credential
+			// is ours, not the caller's. Nothing to retry, because the
+			// key will not fix itself between attempts. But a provider
+			// we cannot authenticate to is completely unusable, which is
+			// the definition of unhealthy: the breaker should open so we
+			// stop paying a round trip per request to an upstream that
+			// can serve none of them, and the chain should route around
+			// it. Key rotation and billing lapses are exactly the
+			// incident failover exists to absorb.
+			return false, true
 		default:
 			// Every other 4xx is a request the provider understood and
-			// refused: bad key, bad model, context too long. Retrying
-			// replays the same refusal.
+			// refused: bad model, context too long, malformed messages.
+			// Retrying replays the same refusal, and so would every
+			// other vendor.
 			return false, false
 		}
 	}
@@ -108,23 +121,31 @@ func classify(err error) (retry, unhealthy bool) {
 // ShouldFallback reports whether a different provider is worth trying
 // after err.
 //
-// It is the same question classify already answers for retry — "could
-// this have gone differently?" — asked about a different provider rather
-// than a second attempt at the same one, and the answers coincide. A 500
-// or a dial failure is worth escaping; a 400 is a refusal any provider
-// would repeat, so falling back would turn one honest error into a tour
-// of the whole chain before returning the same thing.
+// Either half of classify's answer is reason enough. Retryable means the
+// call could have gone differently, so it could go differently
+// elsewhere. Unhealthy means this provider is the problem, which is the
+// most direct argument there is for asking a different one. Only an
+// error that is neither — a 400, a context-length overflow, a request we
+// malformed ourselves — stays put, because that is a refusal every
+// vendor would repeat and walking the chain would turn one honest error
+// into a tour of it.
+//
+// Deriving this from retry alone was wrong, and 401 is where it showed:
+// an expired API key is not retryable, so a healthy second provider sat
+// idle while every request returned 401. "Worth retrying" and "worth
+// escaping" are not the same question, and they come apart precisely on
+// the failures that are about the provider rather than the request.
 //
 // An open breaker is the case the fallback chain exists for, and it is
-// called out explicitly here rather than left to fall through classify's
-// default branch, because "the reason we did not call this provider is
-// exactly why we should call another one" is the point, not a detail.
+// called out explicitly here rather than left to classify, because "the
+// reason we did not call this provider is exactly why we should call
+// another one" is the point, not a detail.
 func ShouldFallback(err error) bool {
 	if errors.Is(err, ErrOpen) {
 		return true
 	}
-	retry, _ := classify(err)
-	return retry
+	retry, unhealthy := classify(err)
+	return retry || unhealthy
 }
 
 // backoff returns how long to wait before the next attempt, and whether

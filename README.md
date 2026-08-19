@@ -112,6 +112,8 @@ fallback:
 
 A breaker entry naming a provider this build has no key for is ignored with a startup warning rather than refusing to boot: whether `openai` exists is a property of the environment, not of the file, and the same config is meant to deploy to both. Everything checkable from the file alone — an unknown key, a fallback entry that is not an alias, a chain that includes itself — is still a hard parse error.
 
+> **Rolling back:** strict parsing couples the config file to the binary in one direction. A build that predates a config block treats it as an unknown key, which is a startup error and not a warning, so the process exits without binding a listener rather than degrading. Roll `gateway.yaml` back in the same step as the binary — a `breakers:` or `fallback:` block left in place will stop an older gateway from starting at all.
+
 ### Environment
 
 | Variable | Default | Purpose |
