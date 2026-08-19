@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -92,14 +91,8 @@ func (a *Anthropic) Health(ctx context.Context) error {
 
 // Do implements Provider.
 func (a *Anthropic) Do(ctx context.Context, req *Request) (*Response, error) {
-	if req == nil {
-		return nil, errors.New("provider: nil request")
-	}
-	if req.Model == "" {
-		return nil, errors.New("provider: model is required")
-	}
-	if len(req.Messages) == 0 {
-		return nil, errors.New("provider: at least one message is required")
+	if err := validate(req); err != nil {
+		return nil, err
 	}
 
 	body := anthropicRequest{
@@ -115,7 +108,7 @@ func (a *Anthropic) Do(ctx context.Context, req *Request) (*Response, error) {
 
 	buf, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, fmt.Errorf("%w: marshal: %w", ErrInvalidRequest, err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(buf))

@@ -44,18 +44,39 @@ type Price struct {
 	Output float64
 }
 
-// prices is the Anthropic list price table, keyed by model ID.
+// prices is the list price table, keyed by model ID.
 //
-// Keys are the canonical IDs Anthropic returns in the response body, so
+// Keys are the canonical IDs providers return in the response body, so
 // we bill against what actually served the request rather than what the
-// client asked for. Lookup falls back to longest-prefix match, which
-// covers date-suffixed IDs (claude-haiku-4-5-20251001) without needing a
-// row per snapshot.
+// client asked for. That matters more now that a request can fail over:
+// an alias that asked for Sonnet and was served by GPT-4o must bill at
+// GPT-4o's rate, and keying on the response model is what makes that
+// automatic rather than something the fallback path has to remember.
 //
-// These are first-party API rates. Bedrock and Vertex are partner-priced
-// differently; when those providers land, they need their own tables
-// rather than a shared one keyed only by model.
+// Lookup falls back to longest-prefix match, but ONLY across a date
+// suffix (claude-haiku-4-5-20251001, gpt-4o-mini-2024-07-18), so a
+// snapshot bills at its family's rate without needing a row per release.
+// Longest wins, so gpt-4o-mini bills as itself and not as gpt-4o. See
+// hasModelPrefix for why a variant suffix must never inherit.
+//
+// Every row is a published first-party rate, not an interpolation. A
+// model that is missing here bills zero and warns, which is loud and
+// fixable; a model that inherits a plausible-looking wrong rate is
+// neither. When in doubt, leave it out.
+//
+// One flat table is safe only while every model ID is unique to one
+// vendor's first-party API, which is true today. It stops being true for
+// resold endpoints — Bedrock and Vertex serve Claude IDs at partner
+// rates, Azure serves GPT IDs at its own — so those need a table keyed
+// by {provider, model} rather than a row added here.
+//
+// OpenAI rates verified against developers.openai.com/api/docs/pricing
+// on 2026-08-18. The GPT-5.5 and GPT-5.4 families are published as a
+// "<272K context" tier; if a long-context tier is introduced, these stop
+// being a function of the model alone and the table needs a context
+// dimension rather than more rows.
 var prices = map[string]Price{
+	// Anthropic first-party rates, USD per million tokens.
 	"claude-fable-5":    {Input: 10, Output: 50},
 	"claude-mythos-5":   {Input: 10, Output: 50},
 	"claude-opus-5":     {Input: 5, Output: 25},
@@ -65,6 +86,58 @@ var prices = map[string]Price{
 	"claude-sonnet-5":   {Input: 3, Output: 15},
 	"claude-sonnet-4-6": {Input: 3, Output: 15},
 	"claude-haiku-4-5":  {Input: 1, Output: 5},
+
+	// OpenAI first-party rates, USD per million tokens.
+	"gpt-5.6-sol":   {Input: 5, Output: 30},
+	"gpt-5.6-terra": {Input: 2, Output: 12},
+	"gpt-5.6-luna":  {Input: 0.20, Output: 1.20},
+	"gpt-5.5":       {Input: 5, Output: 30},
+	"gpt-5.5-pro":   {Input: 30, Output: 180},
+	"gpt-5.4":       {Input: 2.50, Output: 15},
+	"gpt-5.4-mini":  {Input: 0.75, Output: 4.50},
+	"gpt-5.4-nano":  {Input: 0.20, Output: 1.25},
+	"gpt-5.4-pro":   {Input: 30, Output: 180},
+	"gpt-5.2":       {Input: 1.75, Output: 14},
+	"gpt-5.2-pro":   {Input: 21, Output: 168},
+	"gpt-5.1":       {Input: 1.25, Output: 10},
+	"gpt-5":         {Input: 1.25, Output: 10},
+	"gpt-5-mini":    {Input: 0.25, Output: 2},
+	"gpt-5-nano":    {Input: 0.05, Output: 0.40},
+	"gpt-5-pro":     {Input: 15, Output: 120},
+	"gpt-4.1":       {Input: 2, Output: 8},
+	"gpt-4.1-mini":  {Input: 0.40, Output: 1.60},
+	"gpt-4.1-nano":  {Input: 0.10, Output: 0.40},
+	"gpt-4o":        {Input: 2.50, Output: 10},
+	// The May 2024 GPT-4o snapshot never got the later price cut, so it
+	// needs its own row: it is the case that proves date suffixes cannot
+	// be assumed to share the family's current rate either.
+	"gpt-4o-2024-05-13": {Input: 5, Output: 15},
+	"gpt-4o-mini":       {Input: 0.15, Output: 0.60},
+	"o1":                {Input: 15, Output: 60},
+	"o1-pro":            {Input: 150, Output: 600},
+	"o3":                {Input: 2, Output: 8},
+	"o3-pro":            {Input: 20, Output: 80},
+	"o3-mini":           {Input: 1.10, Output: 4.40},
+	"o4-mini":           {Input: 1.10, Output: 4.40},
+
+	// OpenAI legacy tier. Deprecated rather than retired, and the
+	// provider's Supports() still routes them, so pricing them beats
+	// billing them at zero. Each 3.5 snapshot is listed separately
+	// because they were priced differently and their suffixes are not
+	// dates.
+	"gpt-4-turbo-2024-04-09": {Input: 10, Output: 30},
+	"gpt-4-0613":             {Input: 30, Output: 60},
+	"gpt-3.5-turbo":          {Input: 0.50, Output: 1.50},
+	"gpt-3.5-turbo-0125":     {Input: 0.50, Output: 1.50},
+	"gpt-3.5-turbo-1106":     {Input: 1, Output: 2},
+	"gpt-3.5-turbo-instruct": {Input: 1.50, Output: 2},
+
+	// Deliberately absent: the ChatGPT-surface model published at $5/$30.
+	// The pricing page shows it as "chat-latest", which reads as a
+	// display label rather than an API identifier, and the real ID is
+	// plausibly chatgpt-4o-latest or gpt-5-chat-latest. Guessing which
+	// would either do nothing (a key that never matches) or attach a
+	// rate to the wrong model; leaving it out warns instead.
 }
 
 // PriceFor returns the list price for a model. The false return means
@@ -91,17 +164,72 @@ func PriceFor(model string) (Price, bool) {
 
 // hasModelPrefix reports whether model is id or a dated snapshot of it.
 //
-// The boundary check is the whole point: a bare strings.HasPrefix would
-// make any future model whose ID merely starts with a known one inherit
-// that price and report as priced, so "claude-sonnet-50" would silently
-// bill at Sonnet 5 rates with no unpriced-model warning to catch it.
-// Billing something plausible-but-wrong is worse than billing zero,
-// because nothing downstream looks wrong enough to investigate.
+// Inheriting a price across a suffix is only ever safe for a date. The
+// earlier version of this accepted any hyphen-delimited suffix, on the
+// theory that a bare strings.HasPrefix was the only real hazard —
+// "claude-sonnet-50" must not bill at Sonnet 5's rate. That reasoning
+// was right about the hazard and wrong about its extent. Vendors ship
+// capability variants under hyphenated names too, and those are the ones
+// priced differently: gpt-5-pro is 12x gpt-5, o3-pro is 10x o3, and
+// o3-mini is cheaper than o3. All three read as "the family, dated"
+// under a delimiter-only rule, so all three billed at the base model's
+// rate AND reported as priced — which suppressed the unpriced-model
+// warning that exists to catch exactly this.
+//
+// Requiring the suffix to look like a date inverts the default. An
+// unrecognized variant now falls out of the table and warns instead of
+// silently inheriting, so the failure mode of a new model release is a
+// log line rather than an invisible billing error. That is the trade
+// this function was always trying to make: billing something
+// plausible-but-wrong is worse than billing zero, because nothing
+// downstream looks wrong enough to investigate.
+//
+// Note this excludes "-latest" aliases by design, and that is not
+// collateral damage: chatgpt-4o-latest is priced at twice gpt-4o, so
+// "latest" is not reliably "the family's current rate" either. It also
+// rarely matters in practice, because both providers echo back the
+// concrete dated ID in the response and trackCost bills against that.
 func hasModelPrefix(model, id string) bool {
 	if !strings.HasPrefix(model, id) {
 		return false
 	}
-	return len(model) == len(id) || model[len(id)] == '-'
+	return isDateSuffix(model[len(id):])
+}
+
+// isDateSuffix reports whether s is empty (an exact match) or a release
+// date suffix in one of the two forms the providers actually use:
+// "-20251001" and "-2024-07-18".
+//
+// Deliberately an allow-list of shapes rather than a deny-list of known
+// variant names. A deny-list has to be updated before each new suffix a
+// vendor invents can be billed correctly, and until someone notices, the
+// mis-billing is silent. This way the unknown case is the safe case.
+func isDateSuffix(s string) bool {
+	if s == "" {
+		return true
+	}
+	if s[0] != '-' {
+		return false
+	}
+	switch rest := s[1:]; len(rest) {
+	case len("20251001"):
+		return allDigits(rest)
+	case len("2024-07-18"):
+		return allDigits(rest[0:4]) && rest[4] == '-' &&
+			allDigits(rest[5:7]) && rest[7] == '-' &&
+			allDigits(rest[8:10])
+	default:
+		return false
+	}
+}
+
+func allDigits(s string) bool {
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Cents computes the cost of a completion in US cents. The false return

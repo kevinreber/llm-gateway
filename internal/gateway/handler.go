@@ -15,6 +15,7 @@ import (
 	"github.com/kevinreber/llm-gateway/internal/cost"
 	"github.com/kevinreber/llm-gateway/internal/provider"
 	"github.com/kevinreber/llm-gateway/internal/ratelimit"
+	"github.com/kevinreber/llm-gateway/internal/resilience"
 )
 
 // maxRequestBytes bounds an inbound completion body. LLM requests can
@@ -32,8 +33,19 @@ const maxRequestBytes = 1 << 20 // 1 MiB
 // timeout we take the fail-open branch and serve.
 const limiterTimeout = 250 * time.Millisecond
 
-// handler owns the HTTP routes for the gateway. Phase 3 adds retry and
-// circuit-breaker fallback between resolution and the provider call.
+// defaultCallBudget bounds the entire provider phase of a request: every
+// attempt, every backoff, and every fallback hop combined.
+//
+// The per-provider budget in internal/resilience bounds one provider's
+// share, but N providers in a chain would otherwise multiply it, and
+// "bounded per hop" is not the same as bounded. This is the number that
+// makes the whole path finite, and it is the one that has to stay below
+// the server's WriteTimeout — a request that outlives the write deadline
+// is one the client never gets an answer to no matter how correct the
+// answer was.
+const defaultCallBudget = 150 * time.Second
+
+// handler owns the HTTP routes for the gateway.
 type handler struct {
 	providers map[string]provider.Provider
 	// providerOrder fixes the order resolve() tries providers when the
@@ -47,14 +59,26 @@ type handler struct {
 	limiter       ratelimit.Limiter
 	costs         cost.Tracker
 	logger        *slog.Logger
+	// callBudget overrides defaultCallBudget. Zero means "no budget of
+	// our own", which leaves the request bounded by the client's context
+	// and the per-provider budgets rather than by nothing.
+	callBudget time.Duration
 }
 
-// route is the outcome of resolving a client-supplied model name.
+// route is one attempt: a concrete provider and model, plus the labels
+// that follow the request into logs, headers, and the costs table.
 type route struct {
 	// alias is the name the client asked for when it named an alias,
 	// and empty when it named a concrete model directly. It is the rate
-	// limit key and the cost-attribution label.
-	alias    string
+	// limit key and the cost-attribution label, and it stays fixed
+	// across fallback — a request that asked for `smart` is `smart`
+	// traffic no matter which alias ended up serving it.
+	alias string
+	// via is the fallback alias actually serving, empty on the primary
+	// route. It is what makes a fallback visible without the reader
+	// having to know the config: provider and model tell you where the
+	// request went, via tells you that going there was a fallback.
+	via      string
 	provider provider.Provider
 	model    string
 }
@@ -103,26 +127,147 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send the resolved model upstream, not the alias the client typed.
-	req.Model = rt.model
+	callCtx, cancel := h.withCallBudget(r.Context())
+	defer cancel()
 
-	resp, err := rt.provider.Do(r.Context(), &req)
+	served, resp, err := h.call(callCtx, rt, &req)
 	if err != nil {
 		h.writeProviderError(w, rt, err)
 		return
 	}
 
-	h.trackCost(rt, resp)
+	h.trackCost(served, resp)
 
 	// Tell the client what actually served the request. Without this an
 	// alias is a black box — you can't tell `smart` routed to Anthropic
-	// from `smart` falling back to Ollama (Phase 3) by reading the body.
-	w.Header().Set("X-Gateway-Provider", rt.provider.Name())
-	w.Header().Set("X-Gateway-Model", rt.model)
-	if rt.alias != "" {
-		w.Header().Set("X-Gateway-Alias", rt.alias)
+	// from `smart` falling back to OpenAI by reading the body. These
+	// describe the route that produced this response, not the one the
+	// client asked for, which is the whole reason they are worth having.
+	w.Header().Set("X-Gateway-Provider", served.provider.Name())
+	w.Header().Set("X-Gateway-Model", served.model)
+	if served.alias != "" {
+		w.Header().Set("X-Gateway-Alias", served.alias)
+	}
+	if served.via != "" {
+		w.Header().Set("X-Gateway-Fallback", served.via)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// withCallBudget bounds the provider phase of a request.
+//
+// A zero budget yields a plain cancel-only context rather than an
+// already-expired one. A misconfigured deadline that fails every request
+// instantly is a far worse failure than a missing deadline, and the
+// request still cannot run forever: the client's own context and each
+// provider's budget both still apply.
+func (h *handler) withCallBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	if h.callBudget <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, h.callBudget)
+}
+
+// call walks the fallback chain and returns the route that served,
+// alongside its response.
+//
+// Retry and circuit breaking happen one level down, inside the wrapped
+// provider: by the time Do returns an error here, that provider has
+// already been retried as much as it is going to be. This loop's only
+// job is deciding whether some *other* provider deserves a turn.
+func (h *handler) call(ctx context.Context, rt route, req *provider.Request) (route, *provider.Response, error) {
+	chain := h.chain(rt)
+
+	var firstErr error
+	for i, hop := range chain {
+		// Copy per hop: each provider needs its own resolved model, and
+		// mutating the caller's request would leave the last hop's model
+		// visible to anything that reads it afterwards.
+		attempt := *req
+		attempt.Model = hop.model
+
+		resp, err := hop.provider.Do(ctx, &attempt)
+		if err == nil {
+			if i > 0 {
+				h.logger.Warn("request served by fallback",
+					"alias", hop.alias,
+					"via", hop.via,
+					"provider", hop.provider.Name(),
+					"model", hop.model,
+					"attempts", i+1)
+			}
+			return hop, resp, nil
+		}
+
+		if firstErr == nil {
+			firstErr = err
+		}
+		if i == len(chain)-1 {
+			break
+		}
+		// The client hung up or the whole call budget is gone. Trying
+		// the next provider would burn its quota on a response nobody
+		// is waiting for.
+		if ctx.Err() != nil {
+			break
+		}
+		if !resilience.ShouldFallback(err) {
+			// A refusal the next provider would also produce — a
+			// malformed prompt, a context-length overflow. Falling back
+			// turns one honest 400 into N of them and delays it.
+			break
+		}
+		h.logger.Warn("provider failed, trying fallback",
+			"alias", hop.alias,
+			"provider", hop.provider.Name(),
+			"model", hop.model,
+			"next", chain[i+1].via,
+			"err", err)
+	}
+
+	// Report the primary's failure, not the last hop's: the client asked
+	// for this alias, and why *it* could not be served is the answer to
+	// their question. Every other hop's error was logged above.
+	return rt, nil, firstErr
+}
+
+// chain returns the ordered routes to attempt for rt: the primary first,
+// then each configured fallback alias resolved to its own provider and
+// model.
+//
+// A direct model name gets no fallback. That is not an omission — a
+// caller who names `claude-sonnet-5` outright has asked for that model
+// specifically, and quietly answering with a different one from a
+// different vendor would be the gateway lying about what it did.
+func (h *handler) chain(rt route) []route {
+	if rt.alias == "" {
+		return []route{rt}
+	}
+
+	targets := h.cfg.FallbackFor(rt.alias)
+	hops := make([]route, 0, len(targets)+1)
+	hops = append(hops, rt)
+
+	for _, name := range targets {
+		fb, err := h.resolve(name)
+		if err != nil {
+			// Config validation proved this alias exists; it can still
+			// name a provider this build doesn't have wired. Skipping is
+			// right — a chain of three should not be useless because its
+			// second entry is not deployed yet — and Run already warned
+			// about it once at startup rather than once per request.
+			h.logger.Debug("skipping unroutable fallback",
+				"alias", rt.alias, "fallback", name, "err", err)
+			continue
+		}
+		hops = append(hops, route{
+			alias:    rt.alias,
+			via:      name,
+			provider: fb.provider,
+			model:    fb.model,
+		})
+	}
+	return hops
 }
 
 // resolve maps the client's `model` onto a provider and concrete model.
@@ -167,6 +312,12 @@ func (h *handler) resolve(name string) (route, error) {
 // rate limiter outage should degrade enforcement, not take the gateway
 // down with it. That is the right trade for a cost-control limiter; a
 // limiter guarding correctness rather than spend would want the reverse.
+//
+// This runs once per request, against the alias the client named, and
+// not again for each fallback hop. The limit is a policy attached to the
+// client-facing name, so one request should cost one token from it; also
+// charging the fallback alias would bill a single request twice and add
+// a limiter round-trip to the path that is already the degraded one.
 func (h *handler) allow(ctx context.Context, w http.ResponseWriter, rt route) bool {
 	if rt.alias == "" {
 		return true
@@ -211,9 +362,19 @@ func (h *handler) allow(ctx context.Context, w http.ResponseWriter, rt route) bo
 	return false
 }
 
-// trackCost records a completed request. The provider's reported model
-// is preferred over the requested one: Anthropic echoes back the model
-// that actually served the request, and billing should follow that.
+// trackCost records a completed request against the route that actually
+// served it.
+//
+// The provider's reported model is preferred over the requested one:
+// both Anthropic and OpenAI echo back the model that ran, and billing
+// should follow that. Fallback makes this load-bearing rather than
+// merely tidy — a request that asked for Sonnet and was served by GPT-4o
+// has to appear in the costs table as OpenAI/gpt-4o, at GPT-4o's rate.
+//
+// The alias label is the opposite case and stays as the client-facing
+// name across fallback. Cost is attributed to the traffic that caused
+// it, and `smart` traffic is `smart` traffic wherever it landed; the
+// provider and model columns are what record where that was.
 func (h *handler) trackCost(rt route, resp *provider.Response) {
 	model := resp.Model
 	if model == "" {
@@ -240,6 +401,25 @@ func (h *handler) trackCost(rt route, resp *provider.Response) {
 }
 
 func (h *handler) writeProviderError(w http.ResponseWriter, rt route, err error) {
+	// Every provider in the chain is open. 503 is the honest status —
+	// the gateway is fine, it has simply decided not to call anything
+	// upstream — and the breaker knows exactly when it will next admit a
+	// probe, so the Retry-After we advertise is a real number rather
+	// than a guess.
+	var openErr *resilience.OpenError
+	if errors.As(err, &openErr) {
+		if openErr.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(secondsCeil(openErr.RetryAfter)))
+		}
+		h.logger.Warn("circuit open, refusing request",
+			"provider", openErr.Provider,
+			"alias", rt.alias,
+			"retry_after", openErr.RetryAfter)
+		writeError(w, http.StatusServiceUnavailable, "circuit_open",
+			"no healthy provider for "+describeRoute(rt))
+		return
+	}
+
 	var apiErr *provider.APIError
 	if errors.As(err, &apiErr) {
 		// Mirror the upstream's Retry-After when present so clients get
@@ -270,6 +450,16 @@ func (h *handler) writeProviderError(w http.ResponseWriter, rt route, err error)
 // alongside the shared serve state pattern from bucketd.
 func (h *handler) healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// describeRoute names the route in client-facing error text: the alias
+// when there is one, the model otherwise. The client asked in one of
+// those two vocabularies and should be answered in the same one.
+func describeRoute(rt route) string {
+	if rt.alias != "" {
+		return "alias " + rt.alias
+	}
+	return "model " + rt.model
 }
 
 // secondsCeil rounds up so a sub-second wait advertises 1 rather than 0;

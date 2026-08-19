@@ -96,6 +96,57 @@ func TestParse_Rejects(t *testing.T) {
 			yaml: "aliases:\n  fast: { provider: anthropic, model: m }\nratelimits:\n  fast: { capacity: 1, refill_rate: 0 }\n",
 			want: `ratelimit "fast": refill_rate must be > 0`,
 		},
+		{
+			name: "unknown breaker key",
+			yaml: "breakers:\n  anthropic: { failure_treshold: 5, recovery_timeout: 30s }\n",
+			want: "field failure_treshold not found",
+		},
+		{
+			name: "zero failure threshold",
+			yaml: "breakers:\n  anthropic: { failure_threshold: 0, recovery_timeout: 30s }\n",
+			want: `breaker "anthropic": failure_threshold must be > 0`,
+		},
+		{
+			name: "zero recovery timeout",
+			yaml: "breakers:\n  anthropic: { failure_threshold: 5, recovery_timeout: 0s }\n",
+			want: `breaker "anthropic": recovery_timeout must be > 0`,
+		},
+		{
+			// A duration typo has to fail at parse time. Left to a
+			// custom unmarshaler that swallowed the error, it would
+			// become a zero recovery timeout — a breaker that reopens
+			// instantly and protects nothing.
+			name: "unparseable recovery timeout",
+			yaml: "breakers:\n  anthropic: { failure_threshold: 5, recovery_timeout: 30 furlongs }\n",
+			want: "cannot unmarshal !!str `30 furl...` into time.Duration",
+		},
+		{
+			// The payoff of keying fallback on aliases rather than
+			// provider names: a typo is caught here rather than at 3am.
+			name: "fallback for unknown alias",
+			yaml: "aliases:\n  fast: { provider: anthropic, model: m }\nfallback:\n  fst: [fast]\n",
+			want: `fallback "fst": no alias with that name`,
+		},
+		{
+			name: "fallback to unknown alias",
+			yaml: "aliases:\n  fast: { provider: anthropic, model: m }\nfallback:\n  fast: [slow]\n",
+			want: `fallback "fast": entry "slow" is not an alias`,
+		},
+		{
+			name: "fallback to itself",
+			yaml: "aliases:\n  fast: { provider: anthropic, model: m }\nfallback:\n  fast: [fast]\n",
+			want: `fallback "fast": cannot fall back to itself`,
+		},
+		{
+			name: "duplicate fallback entry",
+			yaml: "aliases:\n  fast: { provider: anthropic, model: m }\n  slow: { provider: anthropic, model: n }\nfallback:\n  fast: [slow, slow]\n",
+			want: `fallback "fast": duplicate entry "slow"`,
+		},
+		{
+			name: "empty fallback entry",
+			yaml: "aliases:\n  fast: { provider: anthropic, model: m }\nfallback:\n  fast: [\"\"]\n",
+			want: `fallback "fast": entry 0 is empty`,
+		},
 	}
 
 	for _, tt := range tests {

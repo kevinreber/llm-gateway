@@ -21,13 +21,27 @@ import (
 )
 
 // fakeProvider records what it was asked for and returns a canned reply.
+//
+// The mutex is load-bearing from Phase 3 on: one provider value is now
+// shared across the goroutines of a chaos run, and the counters these
+// tests assert on would otherwise be read while being written.
 type fakeProvider struct {
+	mu       sync.Mutex
 	name     string
 	supports func(string) bool
 	gotModel string
 	calls    int
 	resp     *provider.Response
 	err      error
+	// errFor overrides err for specific models, so one provider can be
+	// broken for the alias a chain starts at and healthy for the one it
+	// ends at — the shape a real partial outage takes.
+	errFor map[string]error
+	// block makes Do hang until its context expires, which is the
+	// failure mode a per-attempt deadline exists to survive.
+	block time.Duration
+	// doFunc, when set, replaces the canned behavior entirely.
+	doFunc func(*provider.Request) (*provider.Response, error)
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -41,14 +55,32 @@ func (f *fakeProvider) Supports(model string) bool {
 
 func (f *fakeProvider) Health(context.Context) error { return nil }
 
-func (f *fakeProvider) Do(_ context.Context, req *provider.Request) (*provider.Response, error) {
+func (f *fakeProvider) Do(ctx context.Context, req *provider.Request) (*provider.Response, error) {
+	f.mu.Lock()
 	f.calls++
 	f.gotModel = req.Model
-	if f.err != nil {
-		return nil, f.err
+	err := f.err
+	if e, ok := f.errFor[req.Model]; ok {
+		err = e
 	}
-	if f.resp != nil {
-		return f.resp, nil
+	resp, block, doFunc := f.resp, f.block, f.doFunc
+	f.mu.Unlock()
+
+	if block > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(block):
+		}
+	}
+	if doFunc != nil {
+		return doFunc(req)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil {
+		return resp, nil
 	}
 	return &provider.Response{
 		Content:    "ok",
