@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -203,6 +205,112 @@ func TestGateway_ForwardsRetryAfter(t *testing.T) {
 	}
 	if got := resp.Header.Get("Retry-After"); got != "30" {
 		t.Errorf("Retry-After = %q, want %q", got, "30")
+	}
+}
+
+// TestGateway_AliasEndToEnd covers the wiring Run() does that the
+// handler tests mock out: reading gateway.yaml off disk, translating the
+// alias before the upstream call, and running the cost writer against
+// the no-database sink without breaking the request path.
+func TestGateway_AliasEndToEnd(t *testing.T) {
+	gotModel := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotModel <- body.Model
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id": "msg_alias",
+			"type": "message",
+			"role": "assistant",
+			"content": [{"type":"text","text":"routed"}],
+			"model": "claude-sonnet-5",
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 1000, "output_tokens": 500}
+		}`)
+	}))
+	defer upstream.Close()
+
+	configPath := filepath.Join(t.TempDir(), "gateway.yaml")
+	if err := os.WriteFile(configPath, []byte(
+		"aliases:\n  smart: { provider: anthropic, model: claude-sonnet-5 }\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	addr := reservePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- gateway.Run(ctx, gateway.Config{
+			Addr:             addr,
+			ShutdownTimeout:  2 * time.Second,
+			AnthropicAPIKey:  "test-key",
+			AnthropicBaseURL: upstream.URL,
+			ConfigPath:       configPath,
+			// No BUCKETD_ADDRS and no DATABASE_URL: the gateway must
+			// serve normally with both dependencies absent.
+		})
+	}()
+	waitReady(t, "http://"+addr+"/healthz", 2*time.Second)
+
+	resp, err := http.Post("http://"+addr+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Gateway-Alias"); got != "smart" {
+		t.Errorf("X-Gateway-Alias = %q, want smart", got)
+	}
+	if got := resp.Header.Get("X-Gateway-Model"); got != "claude-sonnet-5" {
+		t.Errorf("X-Gateway-Model = %q, want claude-sonnet-5", got)
+	}
+
+	select {
+	case m := <-gotModel:
+		if m != "claude-sonnet-5" {
+			t.Errorf("upstream received model %q, want claude-sonnet-5", m)
+		}
+	default:
+		t.Fatal("upstream was never called")
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Errorf("Run returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not shut down within 3s")
+	}
+}
+
+// TestGateway_MissingExplicitConfigFails guards the operator-intent
+// rule: an explicitly configured path that doesn't exist must abort
+// startup rather than silently serving with no rate limits.
+func TestGateway_MissingExplicitConfigFails(t *testing.T) {
+	err := gateway.Run(context.Background(), gateway.Config{
+		Addr:            reservePort(t),
+		ShutdownTimeout: time.Second,
+		AnthropicAPIKey: "test-key",
+		ConfigPath:      filepath.Join(t.TempDir(), "does-not-exist.yaml"),
+	})
+	if err == nil {
+		t.Fatal("Run succeeded with a missing explicit config path, want an error")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist.yaml") {
+		t.Errorf("err = %q, want it to name the missing path", err)
 	}
 }
 

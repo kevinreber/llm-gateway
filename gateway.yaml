@@ -1,0 +1,26 @@
+# Sample gateway config.
+#
+# Clients ask for an alias (`"model": "smart"`); the gateway resolves it
+# to a concrete {provider, model} and forwards that upstream. Changing
+# this file shifts traffic without a code change — and from Phase 4, with
+# no restart either.
+#
+# Parsing is strict: an unknown key is a startup error, not a silent
+# no-op. A typo here should never quietly disable a rate limit.
+
+aliases:
+  fast:  { provider: anthropic, model: claude-haiku-4-5 }
+  smart: { provider: anthropic, model: claude-sonnet-5 }
+  best:  { provider: anthropic, model: claude-opus-5 }
+  code:  { provider: anthropic, model: claude-sonnet-5 }
+
+# Token-bucket policy per alias, enforced across every gateway instance
+# via bucketd. `capacity` is the burst ceiling; `refill_rate` is the
+# sustained rate in tokens per second.
+#
+# An alias with no entry here is unlimited. That is deliberate: a missing
+# limit should serve traffic rather than fail closed on an omission.
+ratelimits:
+  fast:  { capacity: 100, refill_rate: 50 }
+  smart: { capacity: 50, refill_rate: 20 }
+  best:  { capacity: 10, refill_rate: 2 }

@@ -1,8 +1,8 @@
-// Command gateway is the LLM API gateway server. It reverse-proxies
-// completion requests to an upstream provider (Phase 1: Anthropic only),
-// with the shape ready to grow into alias-based multi-provider routing,
-// rate limiting via bucketd, cost tracking, and circuit-breaker fallback
-// in later phases.
+// Command gateway is the LLM API gateway server. It resolves client
+// aliases to concrete models, enforces per-alias rate limits via bucketd,
+// reverse-proxies the completion to a provider (Anthropic today), and
+// records what the request cost. Circuit-breaker fallback across multiple
+// providers lands next; see the roadmap in README.md.
 //
 // Configuration is via environment variables (see internal/gateway/run.go).
 // Shutdown is graceful: SIGTERM/SIGINT triggers Run's shutdown path,
