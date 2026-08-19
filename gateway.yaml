@@ -48,8 +48,10 @@ ratelimits:
 # 5xx responses and transport failures count against the threshold. A 429
 # does not — a rate-limited provider is a healthy provider telling us to
 # slow down, and taking it out of rotation would punish everyone for one
-# noisy caller. Neither does a 4xx, which is a refusal of the request
-# rather than a failure of the provider.
+# noisy caller. Neither does most of the 4xx range, which is a refusal of
+# the request rather than a failure of the provider. The exceptions are
+# 401 and 403, which say the credential is bad and so the provider can
+# serve nothing, and 408, which says it was too slow; all three count.
 #
 # An entry for a provider this build has no key for is ignored, with a
 # warning at startup.
@@ -71,7 +73,8 @@ breakers:
 # detect, and caps a request's worst case at the length of one list.
 #
 # A chain is tried when the primary cannot serve: its breaker is open, it
-# returned 5xx after retries, or it could not be reached. A 4xx is not a
+# returned 5xx or 408 after retries, it could not be reached, or it
+# rejected our credential with a 401 or 403. Most 4xx responses are not a
 # fallback trigger — a malformed prompt fails the same way everywhere, so
 # retrying it down the chain would turn one honest error into four.
 #
