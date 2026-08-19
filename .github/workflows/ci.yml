@@ -7,6 +7,28 @@ jobs:
     strategy:
       matrix:
         go-version: ["1.25", "1.26"]
+
+    services:
+      # The cost-store tests skip when TEST_DATABASE_URL is unset, so a
+      # laptop without Postgres can still run `go test ./...`. CI sets it,
+      # which is what makes those tests actually run somewhere.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway_test?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
