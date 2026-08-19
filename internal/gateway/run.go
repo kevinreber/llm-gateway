@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 	"github.com/kevinreber/llm-gateway/internal/cost"
 	"github.com/kevinreber/llm-gateway/internal/provider"
 	"github.com/kevinreber/llm-gateway/internal/ratelimit"
+	"github.com/kevinreber/llm-gateway/internal/resilience"
 	"github.com/kevinreber/llm-gateway/internal/store"
 )
 
@@ -48,6 +51,14 @@ type Config struct {
 	// AnthropicBaseURL overrides the production endpoint. Empty string
 	// means production. Used by integration tests to point at a fake.
 	AnthropicBaseURL string
+	// OpenAIAPIKey is the bearer token for the Chat Completions API.
+	// Empty leaves OpenAI unwired, which is a supported deployment —
+	// see LoadConfigFromEnv.
+	OpenAIAPIKey string
+	// OpenAIBaseURL overrides the production endpoint. Also the hook for
+	// pointing at an OpenAI-compatible server (vLLM, LiteLLM) rather
+	// than at OpenAI itself.
+	OpenAIBaseURL string
 	// ConfigPath is the gateway.yaml location. Empty means "try
 	// defaultConfigPath, tolerate its absence".
 	ConfigPath string
@@ -68,12 +79,21 @@ func LoadConfigFromEnv() (Config, error) {
 		ShutdownTimeout:  getenvDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicBaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
+		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:    os.Getenv("OPENAI_BASE_URL"),
 		ConfigPath:       os.Getenv("CONFIG_PATH"),
 		BucketdAddrs:     splitList(os.Getenv("BUCKETD_ADDRS")),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
 	}
-	if cfg.AnthropicAPIKey == "" {
-		return cfg, errors.New("ANTHROPIC_API_KEY is required")
+	// One key is enough to boot. Requiring Anthropic specifically made
+	// sense when it was the only provider; now it would refuse to start
+	// an OpenAI-only deployment for no reason. Requiring none at all is
+	// the case worth keeping as an error — a gateway with no provider
+	// serves nothing and would fail every request at runtime instead of
+	// at boot, which is exactly the trade this repo makes the other way
+	// everywhere else.
+	if cfg.AnthropicAPIKey == "" && cfg.OpenAIAPIKey == "" {
+		return cfg, errors.New("at least one provider key is required (ANTHROPIC_API_KEY, OPENAI_API_KEY)")
 	}
 	return cfg, nil
 }
@@ -121,7 +141,10 @@ func Run(ctx context.Context, cfg Config) error {
 		writerDone.Wait()
 	}()
 
-	providers, order := buildProviders(cfg)
+	providers, order := buildProviders(cfg, gwCfg, logger)
+	if len(providers) == 0 {
+		return errors.New("no providers configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY")
+	}
 	h := &handler{
 		providers:     providers,
 		providerOrder: order,
@@ -129,18 +152,24 @@ func Run(ctx context.Context, cfg Config) error {
 		limiter:       limiter,
 		costs:         writer,
 		logger:        logger,
+		callBudget:    defaultCallBudget,
 	}
+	warnUnroutable(gwCfg, providers, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           h.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
-		// WriteTimeout sits above the provider's own 60s client timeout
-		// so a legitimately slow completion is never cut off, while a
+		// WriteTimeout sits above the gateway's own call budget so a
+		// request that is still legitimately working — retrying, or
+		// partway down a fallback chain — is never cut off, while a
 		// client that stops reading still has its connection reclaimed.
+		// It has to be raised whenever defaultCallBudget is, or the
+		// budget stops being the thing that bounds a request and the
+		// write deadline silently becomes it.
 		// Streaming responses (Phase 5) will need this reconsidered —
 		// an SSE completion can outlive any fixed write deadline.
-		WriteTimeout: 90 * time.Second,
+		WriteTimeout: defaultCallBudget + 30*time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -148,8 +177,10 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() {
 		logger.Info("gateway listening",
 			"addr", cfg.Addr,
+			"providers", order,
 			"aliases", len(gwCfg.Aliases),
-			"ratelimits", len(gwCfg.RateLimits))
+			"ratelimits", len(gwCfg.RateLimits),
+			"fallback_chains", len(gwCfg.Fallback))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
@@ -202,16 +233,93 @@ func loadGatewayConfig(path string, logger *slog.Logger) (*config.Config, error)
 // they are tried for a direct (non-alias) model name. The order is
 // explicit rather than derived from the map so that adding a provider is
 // a deliberate decision about precedence, not an accident of hashing.
-func buildProviders(cfg Config) (map[string]provider.Provider, []string) {
-	anth := provider.NewAnthropic(cfg.AnthropicAPIKey)
-	if cfg.AnthropicBaseURL != "" {
-		anth = provider.NewAnthropicWithBaseURL(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL)
-	}
-	return map[string]provider.Provider{
-			provider.AnthropicName: anth,
-		}, []string{
-			provider.AnthropicName,
+//
+// Every provider goes into the registry already wrapped in its circuit
+// breaker and retry policy. Wrapping here rather than at the call site
+// is what makes the policy total: there is no unwrapped provider for a
+// future route to reach around it, and the wrapper reports the inner
+// provider's Name, so config lookups, cost rows, and the
+// X-Gateway-Provider header are unaffected by its presence.
+func buildProviders(cfg Config, gwCfg *config.Config, logger *slog.Logger) (map[string]provider.Provider, []string) {
+	providers := make(map[string]provider.Provider, 2)
+	var order []string
+
+	add := func(p provider.Provider) {
+		opts := resilience.Options{}
+		if b, ok := gwCfg.BreakerFor(p.Name()); ok {
+			opts.FailureThreshold = b.FailureThreshold
+			opts.RecoveryTimeout = b.RecoveryTimeout
 		}
+		wrapped := resilience.Wrap(p, opts)
+		providers[p.Name()] = wrapped
+		order = append(order, p.Name())
+		logger.Info("provider wired",
+			"provider", p.Name(),
+			"failure_threshold", cmp.Or(opts.FailureThreshold, resilience.DefaultFailureThreshold),
+			"recovery_timeout", cmp.Or(opts.RecoveryTimeout, resilience.DefaultRecoveryTimeout))
+	}
+
+	if cfg.AnthropicAPIKey != "" {
+		if cfg.AnthropicBaseURL != "" {
+			add(provider.NewAnthropicWithBaseURL(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL))
+		} else {
+			add(provider.NewAnthropic(cfg.AnthropicAPIKey))
+		}
+	}
+	if cfg.OpenAIAPIKey != "" {
+		if cfg.OpenAIBaseURL != "" {
+			add(provider.NewOpenAIWithBaseURL(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL))
+		} else {
+			add(provider.NewOpenAI(cfg.OpenAIAPIKey))
+		}
+	}
+	return providers, order
+}
+
+// warnUnroutable reports config that names things this binary cannot
+// reach: aliases pointing at unwired providers, breakers tuning a
+// provider that isn't there, fallback chains whose entries are dead.
+//
+// None of these are startup errors, and that asymmetry against the
+// otherwise-strict config is deliberate. A typo inside gateway.yaml is
+// checkable from the file alone and fails at parse time. Whether
+// `openai` exists is a property of this binary's environment, not of the
+// file, and the same config is meant to be deployed where a key is set
+// and where it isn't. Refusing to boot would make a config that is
+// correct-and-forward-looking indistinguishable from one that is wrong.
+// Saying it out loud once, at startup, is the middle ground: nobody
+// discovers a dead fallback chain from a request-time log at 3am.
+func warnUnroutable(gwCfg *config.Config, providers map[string]provider.Provider, logger *slog.Logger) {
+	for _, name := range sortedKeys(gwCfg.Aliases) {
+		a := gwCfg.Aliases[name]
+		p, ok := providers[a.Provider]
+		switch {
+		case !ok:
+			logger.Warn("alias names a provider that is not wired; requests for it will fail",
+				"alias", name, "provider", a.Provider)
+		case !p.Supports(a.Model):
+			logger.Warn("alias names a model its provider does not serve; requests for it will fail",
+				"alias", name, "provider", a.Provider, "model", a.Model)
+		}
+	}
+	for _, name := range sortedKeys(gwCfg.Breakers) {
+		if _, ok := providers[name]; !ok {
+			logger.Warn("breaker configured for a provider that is not wired; ignored",
+				"provider", name)
+		}
+	}
+}
+
+// sortedKeys mirrors the config package's ordering discipline: startup
+// warnings must come out in the same order on every boot, or comparing
+// two deploys' logs turns into a diffing exercise.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func buildLimiter(addrs []string, logger *slog.Logger) (ratelimit.Limiter, error) {

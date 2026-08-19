@@ -44,18 +44,27 @@ type Price struct {
 	Output float64
 }
 
-// prices is the Anthropic list price table, keyed by model ID.
+// prices is the list price table, keyed by model ID.
 //
-// Keys are the canonical IDs Anthropic returns in the response body, so
+// Keys are the canonical IDs providers return in the response body, so
 // we bill against what actually served the request rather than what the
-// client asked for. Lookup falls back to longest-prefix match, which
-// covers date-suffixed IDs (claude-haiku-4-5-20251001) without needing a
-// row per snapshot.
+// client asked for. That matters more now that a request can fail over:
+// an alias that asked for Sonnet and was served by GPT-4o must bill at
+// GPT-4o's rate, and keying on the response model is what makes that
+// automatic rather than something the fallback path has to remember.
 //
-// These are first-party API rates. Bedrock and Vertex are partner-priced
-// differently; when those providers land, they need their own tables
-// rather than a shared one keyed only by model.
+// Lookup falls back to longest-prefix match, which covers date-suffixed
+// IDs (claude-haiku-4-5-20251001, gpt-4o-mini-2024-07-18) without
+// needing a row per snapshot. Longest wins, so gpt-4o-mini bills as
+// itself and not as gpt-4o.
+//
+// One flat table is safe only while every model ID is unique to one
+// vendor's first-party API, which is true today. It stops being true for
+// resold endpoints — Bedrock and Vertex serve Claude IDs at partner
+// rates, Azure serves GPT IDs at its own — so those need a table keyed
+// by {provider, model} rather than a row added here.
 var prices = map[string]Price{
+	// Anthropic first-party rates, USD per million tokens.
 	"claude-fable-5":    {Input: 10, Output: 50},
 	"claude-mythos-5":   {Input: 10, Output: 50},
 	"claude-opus-5":     {Input: 5, Output: 25},
@@ -65,6 +74,18 @@ var prices = map[string]Price{
 	"claude-sonnet-5":   {Input: 3, Output: 15},
 	"claude-sonnet-4-6": {Input: 3, Output: 15},
 	"claude-haiku-4-5":  {Input: 1, Output: 5},
+
+	// OpenAI first-party rates, USD per million tokens.
+	"gpt-5":        {Input: 1.25, Output: 10},
+	"gpt-5-mini":   {Input: 0.25, Output: 2},
+	"gpt-5-nano":   {Input: 0.05, Output: 0.40},
+	"gpt-4.1":      {Input: 2, Output: 8},
+	"gpt-4.1-mini": {Input: 0.40, Output: 1.60},
+	"gpt-4.1-nano": {Input: 0.10, Output: 0.40},
+	"gpt-4o":       {Input: 2.50, Output: 10},
+	"gpt-4o-mini":  {Input: 0.15, Output: 0.60},
+	"o3":           {Input: 2, Output: 8},
+	"o4-mini":      {Input: 1.10, Output: 4.40},
 }
 
 // PriceFor returns the list price for a model. The false return means

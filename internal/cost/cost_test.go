@@ -49,8 +49,44 @@ func TestCents(t *testing.T) {
 			want: 200, known: true,
 		},
 		{
+			// gpt-4o used to be the example here. It is priced now that
+			// OpenAI is wired, so the unpriced case needs a model from a
+			// vendor the gateway does not serve yet.
 			name:  "unknown model bills nothing and says so",
-			model: "gpt-4o", in: 1000, out: 1000,
+			model: "gemini-2.0-flash", in: 1000, out: 1000,
+			want: 0, known: false,
+		},
+		{
+			// $2.50/MTok in, $10/MTok out:
+			// 400k * 2.50/1M + 100k * 10/1M = $1.00 + $1.00 = 200 cents.
+			name:  "gpt-4o at $2.50/$10",
+			model: "gpt-4o", in: 400_000, out: 100_000,
+			want: 200, known: true,
+		},
+		{
+			// The longest prefix has to win, or a dated mini snapshot
+			// bills at the full model's rate — 16x too high here.
+			// 1M * 0.15/1M = $0.15 = 15 cents.
+			name:  "dated mini snapshot bills as mini, not as gpt-4o",
+			model: "gpt-4o-mini-2024-07-18", in: 1_000_000, out: 0,
+			want: 15, known: true,
+		},
+		{
+			// Dotted family names must not confuse the boundary check.
+			// 1M * 0.40/1M = $0.40 = 40 cents.
+			name:  "gpt-4.1-mini beats gpt-4.1",
+			model: "gpt-4.1-mini", in: 1_000_000, out: 0,
+			want: 40, known: true,
+		},
+		{
+			// 1M * 1.10/1M = $1.10 = 110 cents.
+			name:  "o-series",
+			model: "o4-mini", in: 1_000_000, out: 0,
+			want: 110, known: true,
+		},
+		{
+			name:  "openai near-miss is not a prefix match",
+			model: "gpt-4omni", in: 1_000_000, out: 0,
 			want: 0, known: false,
 		},
 		{

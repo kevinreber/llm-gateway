@@ -14,13 +14,70 @@ aliases:
   best:  { provider: anthropic, model: claude-opus-5 }
   code:  { provider: anthropic, model: claude-sonnet-5 }
 
+  # Second-vendor equivalents. These are ordinary aliases — a client can
+  # ask for them directly — and they double as the fallback targets
+  # below. Keeping them in the same table is the point: a fallback has to
+  # name a model, and an alias is the thing that already pairs a model
+  # with a provider.
+  fast-alt:  { provider: openai, model: gpt-4o-mini }
+  smart-alt: { provider: openai, model: gpt-4o }
+
 # Token-bucket policy per alias, enforced across every gateway instance
 # via bucketd. `capacity` is the burst ceiling; `refill_rate` is the
 # sustained rate in tokens per second.
 #
 # An alias with no entry here is unlimited. That is deliberate: a missing
 # limit should serve traffic rather than fail closed on an omission.
+#
+# The limit is charged once, against the alias the client named. A
+# request that falls back does not also spend a token from the alias it
+# fell back to — one request, one token, from the name the caller used.
 ratelimits:
   fast:  { capacity: 100, refill_rate: 50 }
   smart: { capacity: 50, refill_rate: 20 }
   best:  { capacity: 10, refill_rate: 2 }
+
+# Circuit breaker, per provider.
+#
+# Keyed by provider rather than by alias because it tracks the health of
+# an upstream: every alias pointing at Anthropic shares one API key, one
+# connection pool, and one outage. `failure_threshold` is consecutive
+# failures before the breaker opens; `recovery_timeout` is how long it
+# stays open before admitting one probe request.
+#
+# 5xx responses and transport failures count against the threshold. A 429
+# does not — a rate-limited provider is a healthy provider telling us to
+# slow down, and taking it out of rotation would punish everyone for one
+# noisy caller. Neither does a 4xx, which is a refusal of the request
+# rather than a failure of the provider.
+#
+# An entry for a provider this build has no key for is ignored, with a
+# warning at startup.
+breakers:
+  anthropic: { failure_threshold: 5, recovery_timeout: 30s }
+  openai:    { failure_threshold: 5, recovery_timeout: 30s }
+
+# Fallback chains, per alias.
+#
+# Entries are aliases, not provider names. A fallback has to specify a
+# model as well as a vendor — "fail over from Anthropic to OpenAI" is not
+# actionable until someone says which OpenAI model stands in for Sonnet —
+# and an alias is exactly that decision, already written down. It also
+# means every name here is checked against the alias table at parse time
+# rather than discovered to be dead at 3am.
+#
+# Chains are followed one level deep. The fallbacks of a fallback are
+# never consulted, which makes cycles impossible rather than something to
+# detect, and caps a request's worst case at the length of one list.
+#
+# A chain is tried when the primary cannot serve: its breaker is open, it
+# returned 5xx after retries, or it could not be reached. A 4xx is not a
+# fallback trigger — a malformed prompt fails the same way everywhere, so
+# retrying it down the chain would turn one honest error into four.
+#
+# Aliases absent from this block have no fallback and fail as before.
+fallback:
+  best:  [smart, smart-alt]
+  smart: [smart-alt, fast]
+  code:  [smart-alt]
+  fast:  [fast-alt]

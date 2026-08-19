@@ -1,6 +1,7 @@
 // Package config parses and validates gateway.yaml: the alias table that
 // maps client-facing model names onto concrete {provider, model} pairs,
-// and the per-alias rate-limit policies handed to bucketd.
+// the per-alias rate-limit policies handed to bucketd, the per-provider
+// circuit-breaker settings, and the per-alias fallback chains.
 //
 // Parsing is strict — an unknown key is an error, not a silent no-op. A
 // typo in a production config should fail at startup, not quietly
@@ -17,6 +18,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -39,6 +41,23 @@ type Limit struct {
 	RefillRate float64 `yaml:"refill_rate"`
 }
 
+// Breaker is a per-provider circuit-breaker policy.
+//
+// It is keyed by provider rather than by alias because it describes the
+// health of an upstream dependency, and every alias pointing at that
+// provider shares one connection pool, one API key, and one outage.
+// Tracking failures per alias would need `failure_threshold` failures on
+// each alias separately before any of them stopped calling a provider
+// that is already known to be down.
+type Breaker struct {
+	// FailureThreshold is the number of consecutive failures that trips
+	// the breaker from closed to open.
+	FailureThreshold int `yaml:"failure_threshold"`
+	// RecoveryTimeout is how long the breaker stays open before it
+	// admits a single probe request (half-open).
+	RecoveryTimeout time.Duration `yaml:"recovery_timeout"`
+}
+
 // Config is a parsed gateway.yaml.
 //
 // The zero value is usable and means "no aliases, no limits": every
@@ -46,8 +65,27 @@ type Limit struct {
 // applied. That is deliberately the Phase 1 behavior, so running without
 // a config file still serves traffic.
 type Config struct {
-	Aliases    map[string]Alias `yaml:"aliases"`
-	RateLimits map[string]Limit `yaml:"ratelimits"`
+	Aliases    map[string]Alias   `yaml:"aliases"`
+	RateLimits map[string]Limit   `yaml:"ratelimits"`
+	Breakers   map[string]Breaker `yaml:"breakers"`
+
+	// Fallback maps an alias to the ordered list of aliases to try when
+	// it cannot be served.
+	//
+	// Entries are aliases rather than bare provider names, which is a
+	// deliberate departure from the obvious design. A fallback has to
+	// name a model, not just a vendor: an alias resolving to
+	// {anthropic, claude-sonnet-5} cannot fail over to "openai" without
+	// someone deciding which OpenAI model stands in for Sonnet. An alias
+	// already carries that {provider, model} pair, so a chain of aliases
+	// is the only shape that is complete on its own — and it lets every
+	// key and entry be checked against the alias table at parse time.
+	//
+	// Chains are followed exactly one level deep: the fallbacks of a
+	// fallback are never consulted. That makes cycles structurally
+	// impossible rather than something to detect, and keeps the worst
+	// case for a request equal to the length of one declared list.
+	Fallback map[string][]string `yaml:"fallback"`
 }
 
 // Load reads and validates a config file.
@@ -116,6 +154,46 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("ratelimit %q: refill_rate must be > 0", name)
 		}
 	}
+
+	// Breaker keys are provider names, which this package deliberately
+	// knows nothing about — the provider registry is a property of the
+	// binary, not of the file. An entry for a provider that isn't wired
+	// is therefore unused rather than invalid, and Run warns about it at
+	// startup where the registry is actually in scope.
+	for _, name := range sortedKeys(c.Breakers) {
+		b := c.Breakers[name]
+		if b.FailureThreshold <= 0 {
+			return fmt.Errorf("breaker %q: failure_threshold must be > 0", name)
+		}
+		if b.RecoveryTimeout <= 0 {
+			return fmt.Errorf("breaker %q: recovery_timeout must be > 0", name)
+		}
+	}
+
+	for _, name := range sortedKeys(c.Fallback) {
+		if _, ok := c.Aliases[name]; !ok {
+			return fmt.Errorf("fallback %q: no alias with that name", name)
+		}
+		seen := make(map[string]bool, len(c.Fallback[name]))
+		for i, target := range c.Fallback[name] {
+			switch {
+			case target == "":
+				return fmt.Errorf("fallback %q: entry %d is empty", name, i)
+			case target == name:
+				// Self-fallback would retry the same {provider, model}
+				// that just failed, which is what the retry layer
+				// already did — and did with backoff, which this would
+				// not.
+				return fmt.Errorf("fallback %q: cannot fall back to itself", name)
+			case seen[target]:
+				return fmt.Errorf("fallback %q: duplicate entry %q", name, target)
+			}
+			if _, ok := c.Aliases[target]; !ok {
+				return fmt.Errorf("fallback %q: entry %q is not an alias", name, target)
+			}
+			seen[target] = true
+		}
+	}
 	return nil
 }
 
@@ -131,6 +209,22 @@ func (c *Config) Resolve(name string) (Alias, bool) {
 func (c *Config) LimitFor(alias string) (Limit, bool) {
 	l, ok := c.RateLimits[alias]
 	return l, ok
+}
+
+// BreakerFor returns the circuit-breaker policy for a provider. The
+// false return means "not configured", which callers turn into the
+// package default rather than into a breaker that never trips.
+func (c *Config) BreakerFor(provider string) (Breaker, bool) {
+	b, ok := c.Breakers[provider]
+	return b, ok
+}
+
+// FallbackFor returns the ordered aliases to try after alias fails.
+// Nil means no fallback, which is also what an explicitly empty list in
+// the YAML means — the two are deliberately the same thing, so writing
+// `fast: []` to document "this one does not fail over" costs nothing.
+func (c *Config) FallbackFor(alias string) []string {
+	return c.Fallback[alias]
 }
 
 func sortedKeys[V any](m map[string]V) []string {
