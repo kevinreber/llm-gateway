@@ -28,3 +28,6 @@ gateway.yaml.local
 
 # Vendor (we use modules, not vendor)
 vendor/
+
+# Claude Code session state (agent worktrees are real git repos)
+.claude/

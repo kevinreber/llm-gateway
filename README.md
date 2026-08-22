@@ -122,6 +122,7 @@ A breaker entry naming a provider this build has no key for is ignored with a st
 | `OPENAI_API_KEY` | — | OpenAI bearer token. At least one provider key is required. |
 | `ADDR` | `:8080` | Request-path listen address. |
 | `ADMIN_ADDR` | `:8081` | Admin API and Prometheus exposition. Set to `off` to disable, which also removes `/metrics` — there is no second place it is served. Not `:9090`, which is Prometheus's own default and would collide on the one host guaranteed to run both. |
+| `CONFIG_WATCH` | `on` | Reload `gateway.yaml` automatically when it changes on disk. Set to `off` to require an explicit `POST /admin/reload`. |
 | `CONFIG_PATH` | `gateway.yaml` | Alias config. A missing file at the default path is tolerated; a missing file at an explicitly configured path is a startup error. |
 | `BUCKETD_ADDRS` | — | Comma-separated bucketd nodes. Unset disables rate limiting. |
 | `DATABASE_URL` | — | Postgres DSN for cost tracking. Unset logs cost batches instead of persisting them. |
@@ -152,6 +153,14 @@ That split is a security boundary, not organization. The exposition discloses cu
 `POST /admin/reload` parses and validates before swapping, so a file with a typo in it returns `400` and leaves the running config untouched. The failure mode of a bad edit is "the change did not take effect", never "routing is now broken", because the second one is discovered by traffic. The response also names any alias the new config declares that this binary cannot serve, which tells the operator who just made the edit rather than leaving it for a request at 3am.
 
 A request reads the configuration once, at the top, and uses that snapshot throughout. A reload landing mid-request cannot make one request resolve its alias against one config and take its rate limit from another.
+
+### Watching the config file
+
+With `CONFIG_WATCH=on` (the default), editing `gateway.yaml` and saving it is enough — the next request routes by the new table, with no restart and no admin call. The same validate-before-swap rule applies, so a typo costs a log line and nothing else, and the recovery is saving the file again.
+
+The watcher watches the file's **directory** and filters by name, rather than watching the file. Editors and deploy tooling replace a config by writing a temporary file and renaming it over the target, which leaves the original inode deleted. Whether that breaks a path-level watch is backend-specific — fsnotify's kqueue backend re-establishes it on macOS, while inotify delivers `IN_MOVE_SELF` and the watch is simply over — and depending on the kqueue behavior would mean automatic reload quietly not working on Linux, which is where this runs.
+
+Writes are debounced by 150ms. One save is rarely one event: an editor writing in place produces `WRITE` and `CHMOD`, one writing through a temporary file produces `CREATE` then `RENAME`. Reloading on each would parse half-written files and log validation errors for a config that is about to be fine.
 
 
 Every 200 response carries the routing headers:
@@ -216,7 +225,7 @@ Delivered:
 
 Planned:
 
-4. **Observability** *(partly delivered)* — Prometheus metrics for request counts, latency, breaker state and cost totals, structured JSON logs keyed by request ID, a shutdown-aware `/healthz`, and an admin API on its own listener with config reload through a lock-free atomic swap. Still to come: picking up file edits automatically via `fsnotify`, rather than requiring a `POST /admin/reload`.
+4. **Observability** — Prometheus metrics for request counts, latency, breaker state and cost totals; structured JSON logs keyed by request ID; a shutdown-aware `/healthz`; an admin API on its own listener; and hot config reload through a lock-free atomic swap, triggered either by `POST /admin/reload` or by an `fsnotify` watch on the config file.
 5. **Caching and remaining providers** — exact cache keyed on a SHA-256 of the canonicalized request, optional pgvector semantic cache behind it, plus Gemini and Ollama clients.
 6. **Deployment** — multi-stage distroless image, Fly.io config.
 
