@@ -132,6 +132,18 @@ var prices = map[string]Price{
 	"gpt-3.5-turbo-1106":     {Input: 1, Output: 2},
 	"gpt-3.5-turbo-instruct": {Input: 1.50, Output: 2},
 
+	// Gemini, USD per million tokens.
+	"gemini-2.5-pro":   {Input: 1.25, Output: 10},
+	"gemini-2.5-flash": {Input: 0.30, Output: 2.50},
+	"gemini-2.0-flash": {Input: 0.10, Output: 0.40},
+	"gemini-1.5-pro":   {Input: 1.25, Output: 5},
+	"gemini-1.5-flash": {Input: 0.075, Output: 0.30},
+
+	// Every locally-served model, at its real price. Local inference
+	// costs electricity, not tokens, and there is no per-token rate to
+	// look up. See LocalModelID for why they all share one entry.
+	LocalModelID: {Input: 0, Output: 0},
+
 	// Deliberately absent: the ChatGPT-surface model published at $5/$30.
 	// The pricing page shows it as "chat-latest", which reads as a
 	// display label rather than an API identifier, and the real ID is
@@ -139,6 +151,16 @@ var prices = map[string]Price{
 	// would either do nothing (a key that never matches) or attach a
 	// rate to the wrong model; leaving it out warns instead.
 }
+
+// localModelPrefix marks a model served by a local runtime. Kept as a
+// literal rather than imported from internal/provider, so the pricing
+// table does not take a dependency on the client packages; the two are
+// asserted to agree by a test in the provider package.
+const localModelPrefix = "ollama/"
+
+// LocalModelID is the single pricing-table entry every locally-served
+// model bills and reports under.
+const LocalModelID = "ollama/local"
 
 // PriceFor returns the list price for a model. The false return means
 // the model is not in the table — callers should record a zero cost and
@@ -170,6 +192,14 @@ func PriceFor(model string) (Price, bool) {
 func CanonicalModel(model string) (string, bool) {
 	if _, ok := prices[model]; ok {
 		return model, true
+	}
+	// Every locally-served model collapses onto one ID. Two reasons,
+	// and they point the same way: local inference has no per-token
+	// price to distinguish, and the set of things an operator can pull
+	// onto a box is unbounded, so a label per local model is a label
+	// the provider — here, whoever runs the box — controls.
+	if strings.HasPrefix(model, localModelPrefix) {
+		return LocalModelID, true
 	}
 	// Longest-prefix match so a dated snapshot bills at its family's
 	// rate. Longest wins because "claude-opus-4-8" and a hypothetical

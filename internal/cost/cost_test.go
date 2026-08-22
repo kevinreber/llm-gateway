@@ -49,11 +49,13 @@ func TestCents(t *testing.T) {
 			want: 200, known: true,
 		},
 		{
-			// gpt-4o used to be the example here. It is priced now that
-			// OpenAI is wired, so the unpriced case needs a model from a
-			// vendor the gateway does not serve yet.
+			// This case needs a model from a vendor the gateway does not
+			// serve, and it has now been rewritten twice — gpt-4o, then
+			// gemini-2.0-flash — because each got priced as its client
+			// landed. That churn is the test working: a model becoming
+			// priced should break the assertion that it is not.
 			name:  "unknown model bills nothing and says so",
-			model: "gemini-2.0-flash", in: 1000, out: 1000,
+			model: "command-r-plus", in: 1000, out: 1000,
 			want: 0, known: false,
 		},
 		{

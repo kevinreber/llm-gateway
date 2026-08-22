@@ -118,8 +118,10 @@ A breaker entry naming a provider this build has no key for is ignored with a st
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Anthropic `x-api-key` value. At least one provider key is required. |
-| `OPENAI_API_KEY` | — | OpenAI bearer token. At least one provider key is required. |
+| `ANTHROPIC_API_KEY` | — | Anthropic `x-api-key` value. At least one provider must be configured. |
+| `OPENAI_API_KEY` | — | OpenAI bearer token. |
+| `GEMINI_API_KEY` | — | Google Generative Language key. Sent as `x-goog-api-key`, not as a `?key=` query param. |
+| `OLLAMA_BASE_URL` | — | A local Ollama server, e.g. `http://localhost:11434`. Ollama has no API key, so the presence of a URL is the switch. |
 | `ADDR` | `:8080` | Request-path listen address. |
 | `ADMIN_ADDR` | `:8081` | Admin API and Prometheus exposition. Set to `off` to disable, which also removes `/metrics` — there is no second place it is served. Not `:9090`, which is Prometheus's own default and would collide on the one host guaranteed to run both. |
 | `CONFIG_WATCH` | `on` | Reload `gateway.yaml` automatically when it changes on disk. Set to `off` to require an explicit `POST /admin/reload`. |
@@ -203,6 +205,21 @@ The latency histogram covers only requests that reached the provider phase. Requ
 
 `/admin/stats` reads its per-provider request counts back out of the metric registry rather than keeping a second tally, so it and `/metrics` cannot disagree. Two independent counts of the same events drift the moment one is updated on a path the other missed, and the version an operator sees during an incident is whichever one they happened to open.
 
+## Providers
+
+Four clients, all behind the same interface, all normalized onto the Anthropic-shaped surface the gateway exposes. A client that handles `end_turn` and `input_tokens` keeps working when an alias falls over to a different vendor — a fallback that changed the response vocabulary would push the provider difference onto every caller, which defeats the point of having a gateway.
+
+| Provider | Claims models | Notes |
+|---|---|---|
+| `anthropic` | `claude-*` | System prompt is a top-level field. |
+| `openai` | `gpt-*`, `chatgpt-*`, `o1`/`o3`/`o4` | System prompt becomes the first message. `max_completion_tokens`, since `max_tokens` is rejected by the reasoning models. |
+| `gemini` | `gemini-*` | System prompt is a dedicated `systemInstruction`; the `assistant` role is translated to Gemini's `model`. |
+| `ollama` | `ollama/*` **only** | Prefix is stripped on the wire, so `ollama/llama3` reaches Ollama as `llama3`. |
+
+Ollama's prefix requirement is the one asymmetry, and it is deliberate. The hosted vendors each ship from a known namespace, so a prefix list identifies them. Ollama serves whatever the operator pulled, and that set overlaps every other vendor's — `ollama pull mistral` and a hosted Mistral endpoint are the same string. Any prefix list would be simultaneously incomplete for local models and liable to steal a hosted one. An explicit marker is the only rule that can do neither.
+
+Local models are priced at zero and collapse onto a single `ollama/local` entry for cost reporting. They are *known* to be free rather than unpriced, which matters: an unknown model logs a warning asking somebody to add a price, and a local model has no price to add, so warning every request would be noise that trains people to ignore the real ones.
+
 ## Response caching
 
 Caching is opt-in per alias:
@@ -262,7 +279,7 @@ Delivered:
 Planned:
 
 4. **Observability** — Prometheus metrics for request counts, latency, breaker state and cost totals; structured JSON logs keyed by request ID; a shutdown-aware `/healthz`; an admin API on its own listener; and hot config reload through a lock-free atomic swap, triggered either by `POST /admin/reload` or by an `fsnotify` watch on the config file.
-5. **Caching and remaining providers** *(partly delivered)* — the exact cache keyed on a SHA-256 of the canonicalized request is in, backed by Redis and configured per alias. Still to come: an optional pgvector semantic cache behind it, plus Gemini and Ollama clients.
+5. **Caching and remaining providers** *(partly delivered)* — the exact cache keyed on a SHA-256 of the canonicalized request is in, backed by Redis and configured per alias, and all four provider clients are wired. Still to come: an optional pgvector semantic cache behind the exact one.
 6. **Deployment** — multi-stage distroless image, Fly.io config.
 
 ## License
