@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -316,4 +317,36 @@ func TestRoutes_WrongMethodIsRejected(t *testing.T) {
 	if rec := do(t, h, http.MethodGet, "/admin/reload"); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET /admin/reload = %d, want 405", rec.Code)
 	}
+}
+
+func TestRefreshGauges_IsSafeUnderConcurrentCallers(t *testing.T) {
+	// RefreshGauges has two callers — a Prometheus scrape of /metrics
+	// and an operator reading /admin/stats — on the same listener with
+	// nothing serializing them. Run under -race this fails outright if
+	// the drop bookkeeping is a plain field.
+	h, _ := newHandler(t, "")
+	drops := &stubDrops{}
+	h.Costs = drops
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			path := "/metrics"
+			if n%2 == 0 {
+				path = "/admin/stats"
+			}
+			for j := range 25 {
+				drops.n.Store(int64(j))
+				rec := httptest.NewRecorder()
+				h.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+				if rec.Code != http.StatusOK {
+					t.Errorf("%s = %d", path, rec.Code)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }

@@ -121,7 +121,7 @@ A breaker entry naming a provider this build has no key for is ignored with a st
 | `ANTHROPIC_API_KEY` | — | Anthropic `x-api-key` value. At least one provider key is required. |
 | `OPENAI_API_KEY` | — | OpenAI bearer token. At least one provider key is required. |
 | `ADDR` | `:8080` | Request-path listen address. |
-| `ADMIN_ADDR` | `:9090` | Admin API and Prometheus exposition. Set to `off` to disable, which also removes `/metrics` — there is no second place it is served. |
+| `ADMIN_ADDR` | `:8081` | Admin API and Prometheus exposition. Set to `off` to disable, which also removes `/metrics` — there is no second place it is served. Not `:9090`, which is Prometheus's own default and would collide on the one host guaranteed to run both. |
 | `CONFIG_PATH` | `gateway.yaml` | Alias config. A missing file at the default path is tolerated; a missing file at an explicitly configured path is a startup error. |
 | `BUCKETD_ADDRS` | — | Comma-separated bucketd nodes. Unset disables rate limiting. |
 | `DATABASE_URL` | — | Postgres DSN for cost tracking. Unset logs cost batches instead of persisting them. |
@@ -138,7 +138,7 @@ Migrations in `migrations/` are embedded in the binary and applied at startup wh
 | `POST` | `/v1/messages` | Proxy a completion. Body matches the provider-agnostic `Request` shape. |
 | `GET` | `/healthz` | Readiness. 200 while serving, 503 once shutdown begins so a load balancer drains the instance before the listener closes. |
 
-The operational surface is on a **separate listener** (`ADMIN_ADDR`, default `:9090`):
+The operational surface is on a **separate listener** (`ADMIN_ADDR`, default `:8081`):
 
 | Method | Path | Description |
 |---|---|---|

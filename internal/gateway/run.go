@@ -477,7 +477,13 @@ func splitList(v string) []string {
 // alternative default — sharing :8080 — is the one that leaks spend
 // figures the first time somebody exposes the gateway without reading
 // this file.
-const defaultAdminAddr = ":9090"
+//
+// :8081 rather than the :9090 that first suggests itself for a metrics
+// port, because :9090 is Prometheus's own default. The one setup
+// guaranteed to hit that collision is a laptop running Prometheus to
+// look at this gateway's metrics, which is the first thing anyone does
+// with them.
+const defaultAdminAddr = ":8081"
 
 // adminAddrFromEnv reads ADMIN_ADDR, accepting "off" to disable the
 // listener. Mirrors bucketd's HTTP_ADDR handling, so the two services

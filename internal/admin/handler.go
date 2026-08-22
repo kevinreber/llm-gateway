@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"sync/atomic"
 
 	"github.com/kevinreber/llm-gateway/internal/config"
 	"github.com/kevinreber/llm-gateway/internal/observe"
@@ -68,7 +69,13 @@ type Handler struct {
 	// counter. The writer exposes a running total and a Prometheus
 	// counter only moves by addition, so a scrape publishes the delta
 	// since it last looked.
-	publishedDrops int64
+	//
+	// Atomic because RefreshGauges has two callers, not one: a
+	// Prometheus scrape of /metrics and an operator reading
+	// /admin/stats. Those are different endpoints on the same listener
+	// and nothing serializes them, so "scrapes arrive one at a time" —
+	// true of a single Prometheus target — is not true here.
+	publishedDrops atomic.Int64
 }
 
 // Routes returns the handler for the admin listener.
@@ -151,19 +158,26 @@ func (h *Handler) breaker(name string) (*resilience.Breaker, bool) {
 
 // refreshCostDrops publishes cost events dropped since the last look.
 //
-// Not atomic, and does not need to be: this runs from an http.Handler
-// on the admin listener, which is a single Prometheus target scraped
-// serially. A second concurrent scraper would at worst double-publish
-// one interval's delta, which is a cosmetic error in a number whose
-// only real question is "is it zero or not".
+// The compare-and-swap loop is what keeps the counter exact when a
+// scrape of /metrics and a read of /admin/stats overlap: both call
+// RefreshGauges, and a plain read-modify-write would let them publish
+// overlapping deltas and count the same drops twice. Losing the race
+// means observing a total that has already been published, which the
+// loop then treats as no news.
 func (h *Handler) refreshCostDrops() {
 	if h.Costs == nil {
 		return
 	}
 	total := h.Costs.Dropped()
-	if total > h.publishedDrops {
-		observe.AddDroppedCostEvents(float64(total - h.publishedDrops))
-		h.publishedDrops = total
+	for {
+		prev := h.publishedDrops.Load()
+		if total <= prev {
+			return
+		}
+		if h.publishedDrops.CompareAndSwap(prev, total) {
+			observe.AddDroppedCostEvents(float64(total - prev))
+			return
+		}
 	}
 }
 
