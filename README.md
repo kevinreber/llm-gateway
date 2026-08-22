@@ -252,6 +252,25 @@ Three more properties to decide about before enabling it:
 
 **There is no stampede protection.** N identical requests arriving together all miss, and all call the provider. The cache deflects the *second wave*, not the first. Collapsing them would need single-flight coordination, which is not in this version.
 
+## Deployment
+
+Multi-stage `Dockerfile` producing a distroless image, and a `fly.toml` for Fly.io.
+
+```bash
+fly launch --no-deploy          # once, to create the app
+fly secrets set ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...
+fly secrets set DATABASE_URL=postgres://... REDIS_URL=redis://...
+fly deploy
+```
+
+Distroless because there is no shell, no package manager, and no userland to exploit. A gateway holds every provider key the deployment owns, so the blast radius of code execution inside this container is the org's entire LLM spend rather than one service.
+
+**The admin port is not published, and that omission is the security control.** Fly routes only the ports named in a `[[services]]` block. `:8081` deliberately has no such block, which leaves it reachable on the private network and nowhere else — necessary because `POST /admin/reload` repoints live traffic with no authentication, and `/metrics` discloses spend and provider health. Fly's built-in Prometheus scraper reaches instances over that same private network, so `[[metrics]]` can still scrape it. Reach it yourself with `fly proxy 8081:8081`.
+
+`auto_stop_machines` is `off` rather than the usual `stop`. A cold start discards in-memory breaker state and any cost events still buffered. For a service whose job is absorbing provider failures on behalf of callers, forgetting which provider is currently failing is the wrong thing to trade for idle cost.
+
+The build stamps `-X main.version`, logged once at startup. The first question about a misbehaving deployment is which build is running, and answering it from the logs beats shelling into a container that deliberately has no shell.
+
 ## Development
 
 ```bash
@@ -280,7 +299,7 @@ Planned:
 
 4. **Observability** — Prometheus metrics for request counts, latency, breaker state and cost totals; structured JSON logs keyed by request ID; a shutdown-aware `/healthz`; an admin API on its own listener; and hot config reload through a lock-free atomic swap, triggered either by `POST /admin/reload` or by an `fsnotify` watch on the config file.
 5. **Caching and remaining providers** *(partly delivered)* — the exact cache keyed on a SHA-256 of the canonicalized request is in, backed by Redis and configured per alias, and all four provider clients are wired. Still to come: an optional pgvector semantic cache behind the exact one.
-6. **Deployment** — multi-stage distroless image, Fly.io config.
+6. **Deployment** *(partly delivered)* — multi-stage distroless image and Fly.io config are in. Still to come: an actual production deploy and a tagged release.
 
 ## License
 

@@ -93,6 +93,11 @@ type Config struct {
 	// cost batches instead of persisting them, which keeps local
 	// development useful without standing up Postgres.
 	DatabaseURL string
+	// Version is stamped at build time and logged once at startup. The
+	// first question about a misbehaving deployment is which build is
+	// running, and answering it from the logs beats shelling into a
+	// container that deliberately has no shell.
+	Version string
 	// Logger receives structured operational events. Nil defaults to a
 	// slog JSON handler on stderr — JSON rather than text because these
 	// lines are meant to be queried by field (request_id, provider,
@@ -246,6 +251,7 @@ func Run(ctx context.Context, cfg Config) error {
 	adminSrv := startAdminListener(cfg.AdminAddr, store, providers, order, writer, logger, errCh)
 	go func() {
 		logger.Info("gateway listening",
+			"version", cmp.Or(cfg.Version, "dev"),
 			"addr", cfg.Addr,
 			"providers", order,
 			"aliases", len(gwCfg.Aliases),

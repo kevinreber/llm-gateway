@@ -18,6 +18,12 @@ import (
 	"github.com/kevinreber/llm-gateway/internal/gateway"
 )
 
+// version is stamped at build time via
+// -ldflags="-X main.version=...". The Dockerfile passes it from a
+// VERSION build arg. It defaults to "dev" so a `go build` with no flags
+// still produces something honest rather than an empty string.
+var version = "dev"
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -26,6 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	cfg.Version = version
 
 	if err := gateway.Run(ctx, cfg); err != nil {
 		log.Fatalf("run: %v", err)
