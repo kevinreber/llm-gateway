@@ -67,6 +67,10 @@ type Config struct {
 	// BucketdAddrs are the rate-limiter nodes. Empty disables rate
 	// limiting entirely (ratelimit.AllowAll).
 	BucketdAddrs []string
+	// WatchConfig enables reloading gateway.yaml when it changes on
+	// disk. Ignored when no config file was found, since there would be
+	// nothing to watch.
+	WatchConfig bool
 	// AdminAddr is the listen address for the admin API and the
 	// Prometheus exposition. Empty disables the listener entirely, which
 	// also removes /metrics — there is no second place it is served.
@@ -90,6 +94,7 @@ func LoadConfigFromEnv() (Config, error) {
 	cfg := Config{
 		Addr:             getenv("ADDR", ":8080"),
 		AdminAddr:        adminAddrFromEnv(),
+		WatchConfig:      getenv("CONFIG_WATCH", "on") != "off",
 		ShutdownTimeout:  getenvDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicBaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
@@ -187,6 +192,7 @@ func Run(ctx context.Context, cfg Config) error {
 		serving:       &serving,
 	}
 	warnUnroutable(gwCfg, providers, logger)
+	startConfigWatch(ctx, cfg.WatchConfig, store, providers, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -542,4 +548,42 @@ func startAdminListener(
 		}
 	}()
 	return srv
+}
+
+// startConfigWatch begins reloading the config file on change, when
+// asked to and when there is a file to watch.
+//
+// A watcher that cannot start is a warning rather than a boot failure.
+// Losing automatic reload degrades the gateway to the behavior it had
+// one release ago, and POST /admin/reload still works, so refusing to
+// serve traffic over it would trade a working gateway for a
+// convenience.
+func startConfigWatch(
+	ctx context.Context,
+	enabled bool,
+	store *config.Store,
+	providers map[string]provider.Provider,
+	logger *slog.Logger,
+) {
+	if !enabled {
+		logger.Info("config watching disabled; reload via POST /admin/reload")
+		return
+	}
+	if !store.Reloadable() {
+		return
+	}
+
+	// Re-run the startup warning against each new config. A hot reload
+	// is the moment an alias most often starts naming a provider this
+	// binary does not have wired, because the edit was written against
+	// a different deployment — and without this the only sign would be
+	// request-time failures.
+	onReload := func(cfg *config.Config) {
+		warnUnroutable(cfg, providers, logger)
+	}
+
+	if err := config.Watch(ctx, store, logger, onReload); err != nil {
+		logger.Warn("could not watch config file; reload via POST /admin/reload",
+			"path", store.Path(), "err", err)
+	}
 }

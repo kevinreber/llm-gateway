@@ -468,3 +468,71 @@ func TestGateway_ReloadThroughAdminRedirectsLiveTraffic(t *testing.T) {
 		t.Errorf("after reload, served model = %q, want claude-opus-5", got)
 	}
 }
+
+func TestGateway_ConfigWatchRedirectsLiveTrafficWithoutAnyRequest(t *testing.T) {
+	// The Phase 4 milestone: edit gateway.yaml, save it, and the next
+	// request picks up the new aliases. No restart, and no admin call
+	// either — the file itself is the trigger.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		model := "claude-sonnet-5"
+		if strings.Contains(string(body), "claude-opus-5") {
+			model = "claude-opus-5"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"hi"}],"model":"`+model+
+			`","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(
+		"aliases:\n  smart: { provider: anthropic, model: claude-sonnet-5 }\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	addr := reservePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = gateway.Run(ctx, gateway.Config{
+			Addr:             addr,
+			ConfigPath:       cfgPath,
+			WatchConfig:      true,
+			AnthropicAPIKey:  "test-key",
+			AnthropicBaseURL: upstream.URL,
+			ShutdownTimeout:  time.Second,
+		})
+	}()
+	waitReady(t, "http://"+addr+"/healthz", 3*time.Second)
+
+	servedModel := func() string {
+		t.Helper()
+		resp, err := http.Post("http://"+addr+"/v1/messages", "application/json",
+			strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.Header.Get("X-Gateway-Model")
+	}
+
+	if got := servedModel(); got != "claude-sonnet-5" {
+		t.Fatalf("before the edit, served %q", got)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(
+		"aliases:\n  smart: { provider: anthropic, model: claude-opus-5 }\n"), 0o600); err != nil {
+		t.Fatalf("edit config: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if servedModel() == "claude-opus-5" {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Error("traffic never moved to the edited alias")
+}
