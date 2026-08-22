@@ -47,8 +47,19 @@ const (
 	// ResultCircuitOpen is a request refused because every provider in
 	// its fallback chain had an open breaker.
 	ResultCircuitOpen = "circuit_open"
-	// ResultProviderError is a request where an upstream call was made
-	// and failed.
+	// ResultUpstreamRejected is a request the provider refused on its
+	// own terms: a malformed prompt, a context-length overflow, a 429.
+	//
+	// Separate from ResultProviderError because these are not evidence
+	// that the provider is unhealthy, and folding them together would
+	// make the obvious alert — rate of provider_error — page somebody
+	// for a caller sending bad prompts. internal/resilience already
+	// draws this line for the circuit breaker, which is why a 400 does
+	// not count toward opening it; the metric drawing it in a different
+	// place than the breaker would be the inconsistency.
+	ResultUpstreamRejected = "upstream_rejected"
+	// ResultProviderError is a request where the provider itself failed:
+	// a 5xx, a timeout, a transport error.
 	ResultProviderError = "provider_error"
 )
 

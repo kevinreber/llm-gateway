@@ -569,6 +569,13 @@ func (h *handler) writeProviderError(ctx context.Context, w http.ResponseWriter,
 		// "the upstream is unhappy" (5xx) without decoding a wrapped
 		// error. Retry logic (Phase 3) will care about this too.
 		writeError(w, apiErr.Status, apiErr.Type, apiErr.Message)
+		// A 4xx is the provider declining this particular request, not
+		// the provider being broken. Counting it as a provider error
+		// would put caller-caused failures into the series an operator
+		// alerts on.
+		if apiErr.Status < http.StatusInternalServerError {
+			return observe.ResultUpstreamRejected
+		}
 		return observe.ResultProviderError
 	}
 	h.log(ctx).Error("provider call failed",

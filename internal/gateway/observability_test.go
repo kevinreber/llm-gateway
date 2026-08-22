@@ -431,3 +431,37 @@ func TestMetrics_UnpricedModelsShareOneSeries(t *testing.T) {
 		t.Error("unpriced model name leaked into a label")
 	}
 }
+
+func TestMetrics_SeparatesUpstreamRefusalsFromProviderFailures(t *testing.T) {
+	// The obvious alert is the rate of provider_error. If a 400 landed
+	// in it, one caller sending bad prompts would page whoever owns the
+	// gateway. internal/resilience already draws this line for the
+	// breaker; the metric has to draw it in the same place.
+	cases := []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"bad prompt", http.StatusBadRequest, "upstream_rejected"},
+		{"upstream throttling", http.StatusTooManyRequests, "upstream_rejected"},
+		{"upstream broken", http.StatusInternalServerError, "provider_error"},
+		{"upstream overloaded", http.StatusServiceUnavailable, "provider_error"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hn := newFallbackHarness(t, noRetry())
+			hn.anth.err = &provider.APIError{
+				Provider: "anthropic", Status: tc.status, Message: "nope",
+			}
+			series := `llm_gateway_requests_total{alias="lonely",provider="anthropic",result="` + tc.want + `"}`
+
+			before := seriesValue(t, scrape(t, hn.h), series)
+			hn.post(t, "lonely")
+
+			if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 1 {
+				t.Errorf("%s delta = %v, want 1", tc.want, got)
+			}
+		})
+	}
+}
