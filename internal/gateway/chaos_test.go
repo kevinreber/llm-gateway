@@ -133,7 +133,7 @@ func newChaosHandler(t *testing.T, anthURL, oaiURL string) *handler {
 			provider.OpenAIName:    oai,
 		},
 		providerOrder: []string{provider.AnthropicName, provider.OpenAIName},
-		cfg:           cfg,
+		cfg:           config.Static(cfg),
 		limiter:       ratelimit.AllowAll{},
 		costs:         cost.Discard{},
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),

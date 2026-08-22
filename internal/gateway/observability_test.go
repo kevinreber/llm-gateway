@@ -12,22 +12,47 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kevinreber/llm-gateway/internal/admin"
 	"github.com/kevinreber/llm-gateway/internal/provider"
 	"github.com/kevinreber/llm-gateway/internal/ratelimit"
 	"github.com/kevinreber/llm-gateway/internal/resilience"
 )
 
-// scrape drives GET /metrics through the real route, so these tests
-// exercise the scrape-time gauge refresh rather than reaching into the
-// observe package and asserting on what was pushed.
-func scrape(t *testing.T, h *handler) string {
+// scrape drives GET /metrics through the admin handler, which is where
+// the exposition actually lives. Traffic goes in through the gateway
+// and metrics come out through admin, which is the production topology
+// rather than a convenience for the test.
+func scrape(t *testing.T, hn *fallbackHarness) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	h.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	hn.adminHandler().Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /metrics = %d, want 200", rec.Code)
 	}
 	return rec.Body.String()
+}
+
+// adminHandler returns the harness's admin handler, built once and
+// cached.
+//
+// Built once because the drop counter is a delta against state the
+// handler carries between scrapes. A fresh handler per scrape would
+// reset that state and re-publish the whole running total every time,
+// which is exactly the bug the delta logic exists to avoid — and a test
+// that constructed one each call could never catch it.
+func (hn *fallbackHarness) adminHandler() *admin.Handler {
+	if hn.adm == nil {
+		hn.adm = &admin.Handler{
+			Store:     hn.h.cfg,
+			Providers: hn.h.providers,
+			Order:     hn.h.providerOrder,
+			Logger:    hn.h.logger,
+		}
+		if d, ok := hn.h.costs.(admin.DropReporter); ok {
+			hn.adm.Costs = d
+		}
+	}
+	return hn.adm
 }
 
 // seriesValue returns the value of one exposition line, treating an
@@ -70,11 +95,11 @@ func TestMetrics_CountsASuccessfulRequest(t *testing.T) {
 	hn := newFallbackHarness(t, noRetry())
 	const series = `llm_gateway_requests_total{alias="smart",provider="anthropic",result="ok"}`
 
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 	if rec := hn.post(t, "smart"); rec.Code != http.StatusOK {
 		t.Fatalf("POST = %d, want 200", rec.Code)
 	}
-	after := seriesValue(t, scrape(t, hn.h), series)
+	after := seriesValue(t, scrape(t, hn), series)
 
 	if after-before != 1 {
 		t.Errorf("ok count delta = %v, want 1", after-before)
@@ -96,7 +121,7 @@ func TestMetrics_AttributesAFallbackToTheProviderThatServed(t *testing.T) {
 	const servedByOpenAI = `llm_gateway_requests_total{alias="smart",provider="openai",result="ok"}`
 	const servedByAnthropic = `llm_gateway_requests_total{alias="smart",provider="anthropic",result="ok"}`
 
-	body := scrape(t, hn.h)
+	body := scrape(t, hn)
 	beforeOAI := seriesValue(t, body, servedByOpenAI)
 	beforeAnth := seriesValue(t, body, servedByAnthropic)
 
@@ -104,7 +129,7 @@ func TestMetrics_AttributesAFallbackToTheProviderThatServed(t *testing.T) {
 		t.Fatalf("POST = %d, want 200", rec.Code)
 	}
 
-	body = scrape(t, hn.h)
+	body = scrape(t, hn)
 	if got := seriesValue(t, body, servedByOpenAI) - beforeOAI; got != 1 {
 		t.Errorf("openai ok delta = %v, want 1", got)
 	}
@@ -123,13 +148,13 @@ func TestMetrics_CountsShedTraffic(t *testing.T) {
 	}
 
 	const series = `llm_gateway_requests_total{alias="smart",provider="anthropic",result="rate_limited"}`
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 
 	if rec := hn.post(t, "smart"); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("POST = %d, want 429", rec.Code)
 	}
 
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 1 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 1 {
 		t.Errorf("rate_limited delta = %v, want 1", got)
 	}
 }
@@ -138,7 +163,7 @@ func TestMetrics_CountsRequestsRejectedBeforeRouting(t *testing.T) {
 	hn := newFallbackHarness(t, noRetry())
 	const series = `llm_gateway_requests_total{alias="none",provider="none",result="bad_request"}`
 
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 
 	rec := httptest.NewRecorder()
 	hn.h.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
@@ -147,7 +172,7 @@ func TestMetrics_CountsRequestsRejectedBeforeRouting(t *testing.T) {
 		t.Fatalf("POST = %d, want 400", rec.Code)
 	}
 
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 1 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 1 {
 		t.Errorf("bad_request delta = %v, want 1", got)
 	}
 }
@@ -159,7 +184,7 @@ func TestMetrics_DoorRejectionsStayOutOfTheLatencyHistogram(t *testing.T) {
 	hn := newFallbackHarness(t, noRetry())
 	const series = `llm_gateway_request_duration_seconds_count{alias="none",provider="none"}`
 
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 
 	rec := httptest.NewRecorder()
 	hn.h.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
@@ -168,7 +193,7 @@ func TestMetrics_DoorRejectionsStayOutOfTheLatencyHistogram(t *testing.T) {
 		t.Fatalf("POST = %d, want 400", rec.Code)
 	}
 
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 0 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 0 {
 		t.Errorf("histogram count delta = %v, want 0", got)
 	}
 }
@@ -177,10 +202,10 @@ func TestMetrics_ObservesLatencyForServedRequests(t *testing.T) {
 	hn := newFallbackHarness(t, noRetry())
 	const series = `llm_gateway_request_duration_seconds_count{alias="smart",provider="anthropic"}`
 
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 	hn.post(t, "smart")
 
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 1 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 1 {
 		t.Errorf("histogram count delta = %v, want 1", got)
 	}
 }
@@ -193,7 +218,7 @@ func TestMetrics_ReflectsAnOpenBreaker(t *testing.T) {
 	const stateSeries = `llm_gateway_breaker_state{provider="anthropic"}`
 	const healthSeries = `llm_gateway_provider_health{provider="anthropic"}`
 
-	body := scrape(t, hn.h)
+	body := scrape(t, hn)
 	if got := seriesValue(t, body, stateSeries); got != 0 {
 		t.Fatalf("breaker_state before failure = %v, want 0 (closed)", got)
 	}
@@ -204,7 +229,7 @@ func TestMetrics_ReflectsAnOpenBreaker(t *testing.T) {
 	hn.anth.err = &provider.APIError{Provider: "anthropic", Status: 503, Message: "overloaded"}
 	hn.post(t, "lonely")
 
-	body = scrape(t, hn.h)
+	body = scrape(t, hn)
 	if got := seriesValue(t, body, stateSeries); got != 2 {
 		t.Errorf("breaker_state after failure = %v, want 2 (open)", got)
 	}
@@ -221,7 +246,7 @@ func TestMetrics_CountsCircuitOpenSeparatelyFromProviderErrors(t *testing.T) {
 	hn.anth.err = &provider.APIError{Provider: "anthropic", Status: 503, Message: "overloaded"}
 
 	const series = `llm_gateway_requests_total{alias="lonely",provider="anthropic",result="circuit_open"}`
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 
 	hn.post(t, "lonely") // trips the breaker
 	rec := hn.post(t, "lonely")
@@ -229,7 +254,7 @@ func TestMetrics_CountsCircuitOpenSeparatelyFromProviderErrors(t *testing.T) {
 		t.Fatalf("second POST = %d, want 503", rec.Code)
 	}
 
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 1 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 1 {
 		t.Errorf("circuit_open delta = %v, want 1", got)
 	}
 }
@@ -238,10 +263,10 @@ func TestMetrics_CostFollowsTheModelThatBilled(t *testing.T) {
 	hn := newFallbackHarness(t, noRetry())
 	const series = `llm_gateway_cost_cents_total{model="claude-sonnet-5",provider="anthropic"}`
 
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 	hn.post(t, "smart")
 
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got <= 0 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got <= 0 {
 		t.Errorf("cost delta = %v, want > 0", got)
 	}
 }
@@ -398,10 +423,10 @@ func TestMetrics_CollapsesDatedSnapshotsOntoTheFamily(t *testing.T) {
 	const family = `llm_gateway_cost_cents_total{model="claude-sonnet-5",provider="anthropic"}`
 	const snapshot = `llm_gateway_cost_cents_total{model="claude-sonnet-5-20251001",provider="anthropic"}`
 
-	before := seriesValue(t, scrape(t, hn.h), family)
+	before := seriesValue(t, scrape(t, hn), family)
 	hn.post(t, "smart")
 
-	body := scrape(t, hn.h)
+	body := scrape(t, hn)
 	if got := seriesValue(t, body, family) - before; got <= 0 {
 		t.Errorf("family series delta = %v, want > 0", got)
 	}
@@ -423,7 +448,7 @@ func TestMetrics_UnpricedModelsShareOneSeries(t *testing.T) {
 
 	hn.post(t, "smart")
 
-	body := scrape(t, hn.h)
+	body := scrape(t, hn)
 	if !strings.Contains(body, `llm_gateway_cost_cents_total{model="unpriced",provider="anthropic"}`) {
 		t.Error("expected the unpriced bucket series")
 	}
@@ -456,10 +481,10 @@ func TestMetrics_SeparatesUpstreamRefusalsFromProviderFailures(t *testing.T) {
 			}
 			series := `llm_gateway_requests_total{alias="lonely",provider="anthropic",result="` + tc.want + `"}`
 
-			before := seriesValue(t, scrape(t, hn.h), series)
+			before := seriesValue(t, scrape(t, hn), series)
 			hn.post(t, "lonely")
 
-			if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 1 {
+			if got := seriesValue(t, scrape(t, hn), series) - before; got != 1 {
 				t.Errorf("%s delta = %v, want 1", tc.want, got)
 			}
 		})
@@ -486,20 +511,20 @@ func TestMetrics_PublishesDroppedCostEvents(t *testing.T) {
 	hn.h.costs = tr
 
 	const series = "llm_gateway_cost_events_dropped_total"
-	before := seriesValue(t, scrape(t, hn.h), series)
+	before := seriesValue(t, scrape(t, hn), series)
 
 	tr.dropped.Store(3)
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 3 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 3 {
 		t.Fatalf("after 3 drops: delta = %v, want 3", got)
 	}
 
 	// A scrape that sees no new drops must not re-publish the old ones.
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 3 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 3 {
 		t.Errorf("idle scrape: delta = %v, want 3", got)
 	}
 
 	tr.dropped.Store(5)
-	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 5 {
+	if got := seriesValue(t, scrape(t, hn), series) - before; got != 5 {
 		t.Errorf("after 2 more drops: delta = %v, want 5", got)
 	}
 }
@@ -508,5 +533,5 @@ func TestMetrics_TrackerWithoutDropReportingIsSkipped(t *testing.T) {
 	// cost.Discard and the plain recording tracker have no drop count.
 	// Scraping must not panic on the missing method.
 	hn := newFallbackHarness(t, noRetry())
-	scrape(t, hn.h)
+	scrape(t, hn)
 }

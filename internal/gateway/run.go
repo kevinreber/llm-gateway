@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kevinreber/llm-gateway/internal/admin"
 	"github.com/kevinreber/llm-gateway/internal/config"
 	"github.com/kevinreber/llm-gateway/internal/cost"
 	"github.com/kevinreber/llm-gateway/internal/provider"
@@ -66,6 +67,10 @@ type Config struct {
 	// BucketdAddrs are the rate-limiter nodes. Empty disables rate
 	// limiting entirely (ratelimit.AllowAll).
 	BucketdAddrs []string
+	// AdminAddr is the listen address for the admin API and the
+	// Prometheus exposition. Empty disables the listener entirely, which
+	// also removes /metrics — there is no second place it is served.
+	AdminAddr string
 	// DatabaseURL is the Postgres DSN for cost tracking. Empty logs
 	// cost batches instead of persisting them, which keeps local
 	// development useful without standing up Postgres.
@@ -84,6 +89,7 @@ type Config struct {
 func LoadConfigFromEnv() (Config, error) {
 	cfg := Config{
 		Addr:             getenv("ADDR", ":8080"),
+		AdminAddr:        adminAddrFromEnv(),
 		ShutdownTimeout:  getenvDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicBaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
@@ -120,7 +126,7 @@ func Run(ctx context.Context, cfg Config) error {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
 
-	gwCfg, err := loadGatewayConfig(cfg.ConfigPath, logger)
+	gwCfg, configPath, err := loadGatewayConfig(cfg.ConfigPath, logger)
 	if err != nil {
 		return err
 	}
@@ -153,6 +159,13 @@ func Run(ctx context.Context, cfg Config) error {
 		writerDone.Wait()
 	}()
 
+	// The store is what makes reload possible: the handler reads through
+	// it, so replacing its contents redirects live traffic without
+	// touching the handler or restarting the listener. A config that
+	// came from nowhere (no file found) is static, and reload correctly
+	// reports there is nothing to re-read.
+	store := config.NewStore(configPath, gwCfg)
+
 	providers, order := buildProviders(cfg, gwCfg, logger)
 	if len(providers) == 0 {
 		return errors.New("no providers configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY")
@@ -166,7 +179,7 @@ func Run(ctx context.Context, cfg Config) error {
 	h := &handler{
 		providers:     providers,
 		providerOrder: order,
-		cfg:           gwCfg,
+		cfg:           store,
 		limiter:       limiter,
 		costs:         writer,
 		logger:        logger,
@@ -192,7 +205,12 @@ func Run(ctx context.Context, cfg Config) error {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	// Buffered for both listeners. A single slot would leave whichever
+	// goroutine reported second blocked on a send nobody will ever
+	// receive, since Run returns after the first error.
+	errCh := make(chan error, 2)
+
+	adminSrv := startAdminListener(cfg.AdminAddr, store, providers, order, writer, logger, errCh)
 	go func() {
 		logger.Info("gateway listening",
 			"addr", cfg.Addr,
@@ -218,6 +236,15 @@ func Run(ctx context.Context, cfg Config) error {
 		serving.Store(0)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
+		// Admin first, and not for tidiness: it is the listener nothing
+		// is waiting on, and closing it up front stops a scrape from
+		// arriving mid-drain and reporting numbers from a process that
+		// is on its way out.
+		if adminSrv != nil {
+			if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("admin listener shutdown", "err", err)
+			}
+		}
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
@@ -229,7 +256,13 @@ func Run(ctx context.Context, cfg Config) error {
 // that doesn't exist is a hard error — the operator asked for that file,
 // so silently ignoring it would run production with no rate limits. The
 // default path is allowed to be absent.
-func loadGatewayConfig(path string, logger *slog.Logger) (*config.Config, error) {
+// The second return is the path the config actually came from, empty
+// when no file was found. That is what decides whether the running
+// gateway can be reloaded at all, and it has to be the resolved path
+// rather than the requested one — the default is allowed to be absent,
+// and a store pointed at a file that is not there would fail every
+// reload with an error that reads like a bug.
+func loadGatewayConfig(path string, logger *slog.Logger) (*config.Config, string, error) {
 	explicit := path != ""
 	if !explicit {
 		path = defaultConfigPath
@@ -238,18 +271,18 @@ func loadGatewayConfig(path string, logger *slog.Logger) (*config.Config, error)
 	cfg, err := config.Load(path)
 	if err == nil {
 		logger.Info("loaded gateway config", "path", path)
-		return cfg, nil
+		return cfg, path, nil
 	}
 	// errors.Is walks the whole chain; a single Unwrap would silently
 	// flip this check the moment another layer of context is added to
 	// the error, turning a tolerated missing default into a hard boot
 	// failure (or the reverse).
 	if explicit || !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
+		return nil, "", err
 	}
 	logger.Info("no gateway config found; serving direct model names with no rate limits",
 		"path", path)
-	return &config.Config{}, nil
+	return &config.Config{}, "", nil
 }
 
 // buildProviders returns the provider registry and the order in which
@@ -437,4 +470,70 @@ func splitList(v string) []string {
 		}
 	}
 	return out
+}
+
+// defaultAdminAddr keeps the admin surface off the request port by
+// default rather than requiring an operator to know to move it. The
+// alternative default — sharing :8080 — is the one that leaks spend
+// figures the first time somebody exposes the gateway without reading
+// this file.
+const defaultAdminAddr = ":9090"
+
+// adminAddrFromEnv reads ADMIN_ADDR, accepting "off" to disable the
+// listener. Mirrors bucketd's HTTP_ADDR handling, so the two services
+// are turned off the same way.
+func adminAddrFromEnv() string {
+	addr := getenv("ADMIN_ADDR", defaultAdminAddr)
+	if addr == "off" {
+		return ""
+	}
+	return addr
+}
+
+// startAdminListener brings up the admin API and Prometheus exposition
+// on their own port, returning nil when the address is empty.
+//
+// Failures here go to errCh like any other listener failure. An admin
+// port that silently failed to bind is worse than one that refuses to
+// start: the gateway would serve traffic while every scrape and every
+// reload attempt hit a closed port, and the first sign of it would be a
+// dashboard that has been flat for a week.
+func startAdminListener(
+	addr string,
+	store *config.Store,
+	providers map[string]provider.Provider,
+	order []string,
+	costs admin.DropReporter,
+	logger *slog.Logger,
+	errCh chan<- error,
+) *http.Server {
+	if addr == "" {
+		logger.Warn("ADMIN_ADDR is off; /metrics and the admin API are not served")
+		return nil
+	}
+
+	h := &admin.Handler{
+		Store:     store,
+		Providers: providers,
+		Order:     order,
+		Costs:     costs,
+		Logger:    logger,
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           h.Routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+		// No provider calls happen behind these routes, so the generous
+		// budget the request path needs would only serve to keep a stuck
+		// admin connection alive.
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	go func() {
+		logger.Info("admin listening", "addr", addr, "routes", "/admin/aliases /admin/stats /admin/reload /metrics")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("admin listener: %w", err)
+		}
+	}()
+	return srv
 }

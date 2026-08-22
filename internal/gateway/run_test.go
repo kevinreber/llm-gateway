@@ -340,3 +340,131 @@ func waitReady(t *testing.T, url string, timeout time.Duration) {
 	}
 	t.Fatalf("gateway not ready at %s within %s", url, timeout)
 }
+
+func TestGateway_AdminListenerServesOnItsOwnPort(t *testing.T) {
+	// The separation is the security boundary: /admin/reload repoints
+	// live traffic and carries no authentication, so it must not be
+	// reachable on the port that serves clients.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(
+		"aliases:\n  smart: { provider: anthropic, model: claude-sonnet-5 }\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	addr, adminAddr := reservePort(t), reservePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = gateway.Run(ctx, gateway.Config{
+			Addr:            addr,
+			AdminAddr:       adminAddr,
+			ConfigPath:      cfgPath,
+			AnthropicAPIKey: "test-key",
+			ShutdownTimeout: time.Second,
+		})
+	}()
+	waitReady(t, "http://"+addr+"/healthz", 3*time.Second)
+	waitReady(t, "http://"+adminAddr+"/admin/aliases", 3*time.Second)
+
+	// The operational surface answers on the admin port...
+	for _, path := range []string{"/admin/aliases", "/admin/stats", "/metrics"} {
+		resp, err := http.Get("http://" + adminAddr + path)
+		if err != nil {
+			t.Fatalf("GET admin %s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("admin %s = %d, want 200", path, resp.StatusCode)
+		}
+	}
+
+	// ...and not on the request port.
+	for _, path := range []string{"/admin/aliases", "/admin/stats", "/metrics"} {
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET request-port %s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("request port served %s with %d; it must not be there", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestGateway_ReloadThroughAdminRedirectsLiveTraffic(t *testing.T) {
+	// The whole point of the atomic store: editing the file and posting
+	// a reload changes where requests go, with no restart and no
+	// dropped connection.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		model := "claude-sonnet-5"
+		if strings.Contains(string(body), "claude-opus-5") {
+			model = "claude-opus-5"
+		}
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"hi"}],"model":"`+model+
+			`","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(
+		"aliases:\n  smart: { provider: anthropic, model: claude-sonnet-5 }\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	addr, adminAddr := reservePort(t), reservePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = gateway.Run(ctx, gateway.Config{
+			Addr:             addr,
+			AdminAddr:        adminAddr,
+			ConfigPath:       cfgPath,
+			AnthropicAPIKey:  "test-key",
+			AnthropicBaseURL: upstream.URL,
+			ShutdownTimeout:  time.Second,
+		})
+	}()
+	waitReady(t, "http://"+addr+"/healthz", 3*time.Second)
+
+	post := func() string {
+		t.Helper()
+		resp, err := http.Post("http://"+addr+"/v1/messages", "application/json",
+			strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("post = %d: %s", resp.StatusCode, b)
+		}
+		return resp.Header.Get("X-Gateway-Model")
+	}
+
+	if got := post(); got != "claude-sonnet-5" {
+		t.Fatalf("before reload, served model = %q", got)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(
+		"aliases:\n  smart: { provider: anthropic, model: claude-opus-5 }\n"), 0o600); err != nil {
+		t.Fatalf("rewrite config: %v", err)
+	}
+	resp, err := http.Post("http://"+adminAddr+"/admin/reload", "application/json", nil)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reload = %d, want 200", resp.StatusCode)
+	}
+
+	if got := post(); got != "claude-opus-5" {
+		t.Errorf("after reload, served model = %q, want claude-opus-5", got)
+	}
+}

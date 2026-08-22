@@ -160,7 +160,7 @@ func newHarness(t *testing.T, yaml string) *harness {
 		h: &handler{
 			providers:     map[string]provider.Provider{provider.AnthropicName: fp},
 			providerOrder: []string{provider.AnthropicName},
-			cfg:           cfg,
+			cfg:           config.Static(cfg),
 			limiter:       fl,
 			costs:         rt,
 			logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -186,14 +186,14 @@ func TestResolve_DirectModelIsDeterministic(t *testing.T) {
 			"second": second,
 		},
 		providerOrder: []string{"first", "second"},
-		cfg:           &config.Config{},
+		cfg:           config.Static(&config.Config{}),
 		limiter:       ratelimit.AllowAll{},
 		costs:         &recordingTracker{},
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	for i := 0; i < 100; i++ {
-		rt, err := h.resolve("claude-sonnet-5")
+		rt, err := h.resolve(h.cfg.Load(), "claude-sonnet-5")
 		if err != nil {
 			t.Fatalf("iteration %d: resolve: %v", i, err)
 		}
