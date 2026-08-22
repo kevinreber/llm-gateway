@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -561,7 +562,7 @@ func TestChain_IsOneLevelDeep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	chain := hn.h.chain(rt)
+	chain := hn.h.chain(context.Background(), rt)
 
 	if len(chain) != 3 {
 		t.Fatalf("chain length = %d, want 3 (smart, smart-alt, fast)", len(chain))
@@ -583,7 +584,7 @@ func TestWriteProviderError_OpenBreakerNamesTheAlias(t *testing.T) {
 	h := &handler{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	rec := httptest.NewRecorder()
 
-	h.writeProviderError(rec, route{alias: "smart", model: "claude-sonnet-5"},
+	h.writeProviderError(context.Background(), rec, route{alias: "smart", model: "claude-sonnet-5"},
 		&resilience.OpenError{Provider: "anthropic", RetryAfter: 2500 * time.Millisecond})
 
 	if rec.Code != http.StatusServiceUnavailable {
@@ -607,7 +608,7 @@ func TestWriteProviderError_WrappedOpenErrorIsStillRecognized(t *testing.T) {
 
 	wrapped := errors.Join(errors.New("context"),
 		&resilience.OpenError{Provider: "openai", RetryAfter: time.Second})
-	h.writeProviderError(rec, route{alias: "smart"}, wrapped)
+	h.writeProviderError(context.Background(), rec, route{alias: "smart"}, wrapped)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
