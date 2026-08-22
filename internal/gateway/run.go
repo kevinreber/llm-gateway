@@ -62,6 +62,15 @@ type Config struct {
 	// pointing at an OpenAI-compatible server (vLLM, LiteLLM) rather
 	// than at OpenAI itself.
 	OpenAIBaseURL string
+	// GeminiAPIKey is the Google Generative Language key. Empty leaves
+	// Gemini unwired.
+	GeminiAPIKey string
+	// GeminiBaseURL overrides the production endpoint.
+	GeminiBaseURL string
+	// OllamaBaseURL wires a local Ollama server. Ollama has no API key,
+	// so the presence of a URL is the switch — there is nothing else it
+	// could be.
+	OllamaBaseURL string
 	// ConfigPath is the gateway.yaml location. Empty means "try
 	// defaultConfigPath, tolerate its absence".
 	ConfigPath string
@@ -105,6 +114,9 @@ func LoadConfigFromEnv() (Config, error) {
 		AnthropicBaseURL: os.Getenv("ANTHROPIC_BASE_URL"),
 		OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
 		OpenAIBaseURL:    os.Getenv("OPENAI_BASE_URL"),
+		GeminiAPIKey:     os.Getenv("GEMINI_API_KEY"),
+		GeminiBaseURL:    os.Getenv("GEMINI_BASE_URL"),
+		OllamaBaseURL:    os.Getenv("OLLAMA_BASE_URL"),
 		ConfigPath:       os.Getenv("CONFIG_PATH"),
 		BucketdAddrs:     splitList(os.Getenv("BUCKETD_ADDRS")),
 		RedisURL:         os.Getenv("REDIS_URL"),
@@ -118,8 +130,10 @@ func LoadConfigFromEnv() (Config, error) {
 	// serves nothing and would fail every request at runtime instead of
 	// at boot, which is exactly the trade this repo makes the other way
 	// everywhere else.
-	if cfg.AnthropicAPIKey == "" && cfg.OpenAIAPIKey == "" {
-		return cfg, errors.New("at least one provider key is required (ANTHROPIC_API_KEY, OPENAI_API_KEY)")
+	if cfg.AnthropicAPIKey == "" && cfg.OpenAIAPIKey == "" &&
+		cfg.GeminiAPIKey == "" && cfg.OllamaBaseURL == "" {
+		return cfg, errors.New(
+			"at least one provider is required (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL)")
 	}
 	return cfg, nil
 }
@@ -361,6 +375,22 @@ func buildProviders(cfg Config, gwCfg *config.Config, logger *slog.Logger) (map[
 		} else {
 			add(provider.NewOpenAI(cfg.OpenAIAPIKey))
 		}
+	}
+	if cfg.GeminiAPIKey != "" {
+		if cfg.GeminiBaseURL != "" {
+			add(provider.NewGeminiWithBaseURL(cfg.GeminiAPIKey, cfg.GeminiBaseURL))
+		} else {
+			add(provider.NewGemini(cfg.GeminiAPIKey))
+		}
+	}
+	// Ollama last in the order, which only matters for a request that
+	// names a concrete model rather than an alias. It claims names by an
+	// explicit ollama/ marker, so it cannot collide with a hosted
+	// vendor — but ordering it behind them keeps the precedence rule
+	// "hosted before local" true by construction rather than by
+	// depending on that marker staying unique.
+	if cfg.OllamaBaseURL != "" {
+		add(provider.NewOllamaWithBaseURL(cfg.OllamaBaseURL))
 	}
 	return providers, order
 }

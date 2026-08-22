@@ -47,3 +47,32 @@ func TestCanonicalModel_AgreesWithPriceFor(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalModel_LocalModelsCollapseOntoOneID(t *testing.T) {
+	// The set of things an operator can pull onto a box is unbounded,
+	// so a label per local model is a label somebody else controls.
+	// They also all cost the same: nothing per token.
+	for _, m := range []string{"ollama/llama3", "ollama/mistral", "ollama/qwen2.5-coder:7b"} {
+		got, ok := CanonicalModel(m)
+		if !ok {
+			t.Errorf("CanonicalModel(%q) reported unknown; local models are priced at zero", m)
+		}
+		if got != LocalModelID {
+			t.Errorf("CanonicalModel(%q) = %q, want %q", m, got, LocalModelID)
+		}
+	}
+}
+
+func TestCents_LocalModelsAreFreeButKnown(t *testing.T) {
+	// Known matters as much as free. An unknown model logs a warning
+	// and asks somebody to add a price; a local model has no price to
+	// add, so warning about it every request would be noise that
+	// trains people to ignore the real ones.
+	cents, known := Cents("ollama/llama3", 100_000, 100_000)
+	if !known {
+		t.Error("local model reported as unpriced")
+	}
+	if cents != 0 {
+		t.Errorf("cents = %v, want 0", cents)
+	}
+}
