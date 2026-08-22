@@ -120,7 +120,8 @@ A breaker entry naming a provider this build has no key for is ignored with a st
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | Anthropic `x-api-key` value. At least one provider key is required. |
 | `OPENAI_API_KEY` | — | OpenAI bearer token. At least one provider key is required. |
-| `ADDR` | `:8080` | HTTP listen address. |
+| `ADDR` | `:8080` | Request-path listen address. |
+| `ADMIN_ADDR` | `:9090` | Admin API and Prometheus exposition. Set to `off` to disable, which also removes `/metrics` — there is no second place it is served. |
 | `CONFIG_PATH` | `gateway.yaml` | Alias config. A missing file at the default path is tolerated; a missing file at an explicitly configured path is a startup error. |
 | `BUCKETD_ADDRS` | — | Comma-separated bucketd nodes. Unset disables rate limiting. |
 | `DATABASE_URL` | — | Postgres DSN for cost tracking. Unset logs cost batches instead of persisting them. |
@@ -136,7 +137,22 @@ Migrations in `migrations/` are embedded in the binary and applied at startup wh
 |---|---|---|
 | `POST` | `/v1/messages` | Proxy a completion. Body matches the provider-agnostic `Request` shape. |
 | `GET` | `/healthz` | Readiness. 200 while serving, 503 once shutdown begins so a load balancer drains the instance before the listener closes. |
+
+The operational surface is on a **separate listener** (`ADMIN_ADDR`, default `:9090`):
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/aliases` | The live alias table, plus the file it came from and whether it can be reloaded. |
+| `GET` | `/admin/stats` | Per-provider breaker state, health, and request counts by result, plus dropped cost events. |
+| `POST` | `/admin/reload` | Re-read the config file and swap it in. |
 | `GET` | `/metrics` | Prometheus exposition. Breaker gauges are read at scrape time, so they cannot drift from what the request path sees. |
+
+That split is a security boundary, not organization. The exposition discloses cumulative spend, which vendors are wired, and which of them are currently failing. `POST /admin/reload` repoints live traffic and carries **no authentication at all** — there is no credential to leak because there is no credential. Bind `ADMIN_ADDR` somewhere only operators can reach, or set it to `off`.
+
+`POST /admin/reload` parses and validates before swapping, so a file with a typo in it returns `400` and leaves the running config untouched. The failure mode of a bad edit is "the change did not take effect", never "routing is now broken", because the second one is discovered by traffic. The response also names any alias the new config declares that this binary cannot serve, which tells the operator who just made the edit rather than leaving it for a request at 3am.
+
+A request reads the configuration once, at the top, and uses that snapshot throughout. A reload landing mid-request cannot make one request resolve its alias against one config and take its rate limit from another.
+
 
 Every 200 response carries the routing headers:
 
@@ -172,9 +188,7 @@ The latency histogram covers only requests that reached the provider phase. Requ
 
 `llm_gateway_cost_events_dropped_total` is the one number worth alerting on unconditionally. The cost writer drops rather than blocks when its buffer fills, which is the right trade — a slow Postgres must not become the gateway's latency — but any non-zero rate means recorded spend is an undercount, and that is something to learn from a dashboard rather than from a finance question three weeks later.
 
-`/metrics` is served on the same listener as `/v1/messages`, so it is reachable by anyone who can reach the gateway. It discloses cumulative spend, which upstream vendors are wired, and which of them are currently failing. Put the gateway behind a network boundary, or wait for the admin API work below, which moves the operational surface to its own port.
-
-The admin API arrives with the rest of the observability work below.
+`/admin/stats` reads its per-provider request counts back out of the metric registry rather than keeping a second tally, so it and `/metrics` cannot disagree. Two independent counts of the same events drift the moment one is updated on a path the other missed, and the version an operator sees during an incident is whichever one they happened to open.
 
 ## Development
 
@@ -202,7 +216,7 @@ Delivered:
 
 Planned:
 
-4. **Observability** *(partly delivered)* — Prometheus metrics for request counts, latency, breaker state and cost totals, structured JSON logs keyed by request ID, and a shutdown-aware `/healthz` are in. Still to come: an admin API, and hot config reload via `fsnotify` and an `atomic.Value` swap for a lock-free read path.
+4. **Observability** *(partly delivered)* — Prometheus metrics for request counts, latency, breaker state and cost totals, structured JSON logs keyed by request ID, a shutdown-aware `/healthz`, and an admin API on its own listener with config reload through a lock-free atomic swap. Still to come: picking up file edits automatically via `fsnotify`, rather than requiring a `POST /admin/reload`.
 5. **Caching and remaining providers** — exact cache keyed on a SHA-256 of the canonicalized request, optional pgvector semantic cache behind it, plus Gemini and Ollama clients.
 6. **Deployment** — multi-stage distroless image, Fly.io config.
 
