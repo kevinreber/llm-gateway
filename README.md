@@ -1,39 +1,47 @@
 # llm-gateway
 
-A production-grade LLM API gateway in Go. Reverse-proxies completion requests to Anthropic and OpenAI (with Gemini and Ollama planned), resolving client-facing aliases to concrete models, enforcing distributed rate limits via [bucketd](https://github.com/kevinreber/bucketd), recording per-request token cost to Postgres, and failing over between providers when one degrades.
+A production-grade LLM API gateway in Go. Reverse-proxies completion requests to Anthropic, OpenAI, Gemini, and a local Ollama, resolving client-facing aliases to concrete models, enforcing distributed rate limits via [bucketd](https://github.com/kevinreber/bucketd), caching identical requests in Redis, recording per-request token cost to Postgres, and failing over between providers when one degrades.
 
 Built on the `net/http` standard library — no web framework.
 
 ## Status
 
-Working today: HTTP proxy to Anthropic and OpenAI, alias-based routing, per-alias distributed rate limiting, cost tracking, resilience — per-provider circuit breaker, bounded retry with jittered backoff, and a declarative fallback chain — plus Prometheus metrics and structured request-scoped logs. Caching, the admin API, and hot config reload are in progress — see [Roadmap](#roadmap).
+`v0.1.0`. The HTTP surface is stable within the `0.1.x` line.
 
-Not yet tagged for release. The HTTP surface may still change before `v0.1.0`.
+Working today: a reverse proxy to four providers, alias-based routing, per-alias distributed rate limiting, per-alias response caching, cost tracking to Postgres, and resilience — per-provider circuit breaker, bounded retry with jittered backoff, and a declarative fallback chain. Operationally: Prometheus metrics, request-scoped JSON logs, a shutdown-aware `/healthz`, an admin API on its own listener, and hot config reload from either an admin call or a file watch.
+
+Not in `v0.1.0`: streaming responses, tool-use pass-through, and the semantic cache — see [Roadmap](#roadmap).
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    C[Client<br/>model: smart] --> M[POST /v1/messages]
+    C[Client<br/>model: smart] --> M[POST /v1/messages<br/>:8080]
 
     subgraph GW [llm-gateway]
         M --> R[Alias router<br/>gateway.yaml]
         R --> L[Rate limiter]
-        L --> CH[Fallback chain<br/>smart, smart-alt, fast]
+        L --> K[Exact cache<br/>SHA-256 of request]
+        K --> CH[Fallback chain<br/>smart, smart-alt, fast]
         CH --> BR[Breaker + retry<br/>per provider]
         BR --> T[Cost tracker<br/>buffered channel]
     end
 
     L -.->|denied| E[429 + Retry-After]
     L <-->|Allow RPC| B[(bucketd)]
+    K <-->|hit skips the provider| RD[(Redis)]
     T -.->|batched every 1s| DB[(Postgres<br/>costs)]
 
-    BR --> A[Anthropic<br/>Messages API]
-    BR -.->|primary open or 5xx| O[OpenAI<br/>Chat Completions]
+    BR --> A[Anthropic]
+    BR -.->|primary open or 5xx| O[OpenAI / Gemini / Ollama]
     BR -.->|every provider open| U[503 + Retry-After]
 
     A --> RESP[200 + usage]
     O --> RESP
+
+    ADM[Operator] --> AD["/admin/* + /metrics<br/>:8081, private"]
+    AD -.->|reload| R
+    AD -.->|breaker state| BR
 ```
 
 A request carries an alias rather than a model ID. The gateway resolves `smart` to `{provider: anthropic, model: claude-sonnet-5}` from `gateway.yaml`, takes a token from that alias's bucket, forwards the resolved model upstream, and emits a cost event. Editing the YAML shifts traffic without touching code.
@@ -298,8 +306,15 @@ Delivered:
 Planned:
 
 4. **Observability** — Prometheus metrics for request counts, latency, breaker state and cost totals; structured JSON logs keyed by request ID; a shutdown-aware `/healthz`; an admin API on its own listener; and hot config reload through a lock-free atomic swap, triggered either by `POST /admin/reload` or by an `fsnotify` watch on the config file.
-5. **Caching and remaining providers** *(partly delivered)* — the exact cache keyed on a SHA-256 of the canonicalized request is in, backed by Redis and configured per alias, and all four provider clients are wired. Still to come: an optional pgvector semantic cache behind the exact one.
-6. **Deployment** *(partly delivered)* — multi-stage distroless image and Fly.io config are in. Still to come: an actual production deploy and a tagged release.
+5. **Caching and remaining providers** *(partly delivered)* — the exact cache keyed on a SHA-256 of the canonicalized request is in, backed by Redis and configured per alias, and all four provider clients are wired. The pgvector semantic cache is not built; see below.
+6. **Deployment** — multi-stage distroless image and Fly.io config.
+
+Still open after `v0.1.0`:
+
+- **Semantic cache** — a pgvector layer behind the exact cache, so a paraphrased request can hit too. Designed but not built: it needs an embedding call on the request path and a Postgres with the `vector` extension, and shipping vector search that has never executed against a real pgvector would be worse than not shipping it.
+- **Streaming** — the surface is one non-streaming completion. SSE pass-through needs the server's `WriteTimeout` reconsidered, since a streamed completion can outlive any fixed write deadline.
+- **Tool-use pass-through** — `Response.Content` is flattened text today.
+- **Cache stampede protection** — N identical requests arriving together all miss and all call the provider.
 
 ## License
 
