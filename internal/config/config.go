@@ -88,6 +88,10 @@ type Config struct {
 	Fallback map[string][]string `yaml:"fallback"`
 }
 
+// ErrNotReloadable is returned by Store.Reload when the store was built
+// from a value rather than a file, so there is nothing to re-read.
+var ErrNotReloadable = errors.New("config: store has no backing file")
+
 // Load reads and validates a config file.
 func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
