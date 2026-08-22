@@ -18,7 +18,6 @@ import (
 	"github.com/kevinreber/llm-gateway/internal/provider"
 	"github.com/kevinreber/llm-gateway/internal/ratelimit"
 	"github.com/kevinreber/llm-gateway/internal/resilience"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // maxRequestBytes bounds an inbound completion body. LLM requests can
@@ -58,10 +57,12 @@ type handler struct {
 	// say) identical requests would route differently with no way to
 	// reproduce it.
 	providerOrder []string
-	cfg           *config.Config
-	limiter       ratelimit.Limiter
-	costs         cost.Tracker
-	logger        *slog.Logger
+	// cfg is the live config store, not a config value. Reload and the
+	// file watcher swap what it holds while requests are in flight.
+	cfg     *config.Store
+	limiter ratelimit.Limiter
+	costs   cost.Tracker
+	logger  *slog.Logger
 	// callBudget overrides defaultCallBudget. Zero means "no budget of
 	// our own", which leaves the request bounded by the client's context
 	// and the per-provider budgets rather than by nothing.
@@ -71,11 +72,6 @@ type handler struct {
 	// "always serving", which is what a handler constructed directly in
 	// a unit test gets.
 	serving *atomic.Int32
-	// publishedDrops is the cost-writer drop count already reflected in
-	// the metrics counter. The writer exposes a running total, and a
-	// Prometheus counter only moves by addition, so the scrape publishes
-	// the delta since it last looked.
-	publishedDrops atomic.Int64
 }
 
 // requestObs accumulates the metric labels for one request.
@@ -129,91 +125,19 @@ type route struct {
 	model    string
 }
 
-// routes returns the http.Handler for the gateway. The admin API lands
-// with the rest of Phase 4.
+// routes returns the http.Handler for the request path.
+//
+// /metrics and the admin API are deliberately absent: they live on the
+// admin listener, which is bound somewhere only operators can reach.
+// Serving the exposition here would publish cumulative spend and which
+// vendors are currently failing to every client of the gateway.
 func (h *handler) routes() http.Handler {
 	mux := http.NewServeMux()
 	// Go 1.22+ method-scoped routing — anything else on this path
 	// returns 405, we don't need to handle it explicitly.
 	mux.HandleFunc("POST /v1/messages", h.messages)
 	mux.HandleFunc("GET /healthz", h.healthz)
-	mux.Handle("GET /metrics", h.metrics())
 	return withRequestID(mux)
-}
-
-// metrics serves the Prometheus exposition.
-//
-// Breaker gauges are refreshed here, at scrape time, rather than pushed
-// from the breaker's state-change hook. A breaker that has been open
-// long enough to admit a probe reports half-open without any transition
-// having fired, because no request has driven one — so a hook-driven
-// gauge would sit on "open" indefinitely for an idle provider that is in
-// fact ready. Reading the state on the way out means the exported value
-// cannot disagree with what the request path sees.
-func (h *handler) metrics() http.Handler {
-	prom := promhttp.Handler()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.refreshBreakerGauges()
-		h.refreshCostDrops()
-		prom.ServeHTTP(w, r)
-	})
-}
-
-// refreshBreakerGauges publishes the current breaker state for every
-// wired provider.
-//
-// The type assertion is what keeps the registry typed as the plain
-// provider interface: only Run knows the values in it are wrapped. A
-// provider without a breaker is skipped rather than reported as zero,
-// since zero is "closed" and claiming a circuit is closed when there is
-// no circuit would be a worse answer than no answer.
-func (h *handler) refreshBreakerGauges() {
-	for _, name := range h.providerOrder {
-		b, ok := h.providers[name].(interface{ Breaker() *resilience.Breaker })
-		if !ok {
-			continue
-		}
-		observe.SetBreakerState(name, breakerGaugeValue(b.Breaker().State()))
-	}
-}
-
-// refreshCostDrops publishes cost events the writer has dropped since
-// the last scrape.
-//
-// The CAS loop rather than a plain swap is what keeps the counter exact
-// under concurrent scrapes: two scrapes reading different totals could
-// otherwise publish overlapping deltas and inflate the count. Prometheus
-// serializes scrapes of one target in practice, so this is guarding
-// against a second scraper rather than a likely race — but a counter
-// that is only correct when nobody else is looking is not a counter.
-func (h *handler) refreshCostDrops() {
-	d, ok := h.costs.(interface{ Dropped() int64 })
-	if !ok {
-		return
-	}
-	total := d.Dropped()
-	for {
-		prev := h.publishedDrops.Load()
-		if total <= prev {
-			return
-		}
-		if h.publishedDrops.CompareAndSwap(prev, total) {
-			observe.AddDroppedCostEvents(float64(total - prev))
-			return
-		}
-	}
-}
-
-// breakerGaugeValue maps a breaker state onto its gauge encoding.
-func breakerGaugeValue(s resilience.State) float64 {
-	switch s {
-	case resilience.StateOpen:
-		return observe.BreakerOpen
-	case resilience.StateHalfOpen:
-		return observe.BreakerHalfOpen
-	default:
-		return observe.BreakerClosed
-	}
 }
 
 // messages handles POST /v1/messages: decode, resolve the alias, take a
@@ -251,7 +175,12 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rt, err := h.resolve(req.Model)
+	// One snapshot for the whole request. Calling Load at each decision
+	// point would let a reload landing mid-request resolve the alias
+	// against one config and take the rate limit from another.
+	conf := h.cfg.Load()
+
+	rt, err := h.resolve(conf, req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "unresolvable_model", err.Error())
 		return
@@ -259,7 +188,7 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	obs.alias = labelOrNone(rt.alias)
 	obs.provider = rt.provider.Name()
 
-	if !h.allow(r.Context(), w, rt) {
+	if !h.allow(r.Context(), conf, w, rt) {
 		obs.result = observe.ResultRateLimited
 		return
 	}
@@ -271,7 +200,7 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	// which is what the latency histogram is for.
 	obs.reached = true
 
-	served, resp, err := h.call(callCtx, rt, &req)
+	served, resp, err := h.call(callCtx, conf, rt, &req)
 	if err != nil {
 		obs.result = h.writeProviderError(r.Context(), w, rt, err)
 		return
@@ -322,8 +251,8 @@ func (h *handler) withCallBudget(ctx context.Context) (context.Context, context.
 // provider: by the time Do returns an error here, that provider has
 // already been retried as much as it is going to be. This loop's only
 // job is deciding whether some *other* provider deserves a turn.
-func (h *handler) call(ctx context.Context, rt route, req *provider.Request) (route, *provider.Response, error) {
-	chain := h.chain(ctx, rt)
+func (h *handler) call(ctx context.Context, conf *config.Config, rt route, req *provider.Request) (route, *provider.Response, error) {
+	chain := h.chain(ctx, conf, rt)
 
 	var firstErr error
 	for i, hop := range chain {
@@ -386,17 +315,17 @@ func (h *handler) call(ctx context.Context, rt route, req *provider.Request) (ro
 // caller who names `claude-sonnet-5` outright has asked for that model
 // specifically, and quietly answering with a different one from a
 // different vendor would be the gateway lying about what it did.
-func (h *handler) chain(ctx context.Context, rt route) []route {
+func (h *handler) chain(ctx context.Context, conf *config.Config, rt route) []route {
 	if rt.alias == "" {
 		return []route{rt}
 	}
 
-	targets := h.cfg.FallbackFor(rt.alias)
+	targets := conf.FallbackFor(rt.alias)
 	hops := make([]route, 0, len(targets)+1)
 	hops = append(hops, rt)
 
 	for _, name := range targets {
-		fb, err := h.resolve(name)
+		fb, err := h.resolve(conf, name)
 		if err != nil {
 			// Config validation proved this alias exists; it can still
 			// name a provider this build doesn't have wired. Skipping is
@@ -424,8 +353,8 @@ func (h *handler) chain(ctx context.Context, rt route) []route {
 // that isn't an alias falls through to "which provider claims to support
 // this model", which is what preserves the Phase 1 passthrough behavior
 // for callers that name `claude-sonnet-5` outright.
-func (h *handler) resolve(name string) (route, error) {
-	if alias, ok := h.cfg.Resolve(name); ok {
+func (h *handler) resolve(conf *config.Config, name string) (route, error) {
+	if alias, ok := conf.Resolve(name); ok {
 		p, ok := h.providers[alias.Provider]
 		if !ok {
 			// Config names a provider this build doesn't have wired.
@@ -465,11 +394,11 @@ func (h *handler) resolve(name string) (route, error) {
 // client-facing name, so one request should cost one token from it; also
 // charging the fallback alias would bill a single request twice and add
 // a limiter round-trip to the path that is already the degraded one.
-func (h *handler) allow(ctx context.Context, w http.ResponseWriter, rt route) bool {
+func (h *handler) allow(ctx context.Context, conf *config.Config, w http.ResponseWriter, rt route) bool {
 	if rt.alias == "" {
 		return true
 	}
-	limit, ok := h.cfg.LimitFor(rt.alias)
+	limit, ok := conf.LimitFor(rt.alias)
 	if !ok {
 		return true
 	}

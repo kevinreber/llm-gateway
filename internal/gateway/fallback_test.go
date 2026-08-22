@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kevinreber/llm-gateway/internal/admin"
 	"github.com/kevinreber/llm-gateway/internal/config"
 	"github.com/kevinreber/llm-gateway/internal/provider"
 	"github.com/kevinreber/llm-gateway/internal/ratelimit"
@@ -41,7 +42,10 @@ fallback:
 // real resilience layer, so these tests exercise the same composition
 // production runs rather than a hand-rolled stand-in.
 type fallbackHarness struct {
-	h      *handler
+	h *handler
+	// adm is built lazily by adminHandler and cached, so scrape-to-
+	// scrape state survives the way it does in production.
+	adm    *admin.Handler
 	anth   *fakeProvider
 	openai *fakeProvider
 	costs  *recordingTracker
@@ -73,7 +77,7 @@ func newFallbackHarness(t *testing.T, opts resilience.Options) *fallbackHarness 
 				provider.OpenAIName:    wrappedOAI,
 			},
 			providerOrder: []string{provider.AnthropicName, provider.OpenAIName},
-			cfg:           cfg,
+			cfg:           config.Static(cfg),
 			limiter:       ratelimit.AllowAll{},
 			costs:         costs,
 			logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -558,11 +562,11 @@ func TestChain_IsOneLevelDeep(t *testing.T) {
 	// be spliced in.
 	hn := newFallbackHarness(t, noRetry())
 
-	rt, err := hn.h.resolve("smart")
+	rt, err := hn.h.resolve(hn.h.cfg.Load(), "smart")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	chain := hn.h.chain(context.Background(), rt)
+	chain := hn.h.chain(context.Background(), hn.h.cfg.Load(), rt)
 
 	if len(chain) != 3 {
 		t.Fatalf("chain length = %d, want 3 (smart, smart-alt, fast)", len(chain))
