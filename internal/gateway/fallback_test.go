@@ -32,6 +32,9 @@ aliases:
 ratelimits:
   smart: { capacity: 10, refill_rate: 5 }
 
+cache:
+  smart: { ttl: 5m }
+
 fallback:
   smart:  [smart-alt, fast]
   lonely: []

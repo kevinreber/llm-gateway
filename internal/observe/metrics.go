@@ -133,6 +133,14 @@ var (
 		[]string{"provider"},
 	)
 
+	cacheLookups = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llm_gateway_cache_lookups_total",
+			Help: "Cache lookups by layer and outcome: hit, miss, or error.",
+		},
+		[]string{"layer", "result"},
+	)
+
 	costEventsDropped = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "llm_gateway_cost_events_dropped_total",
@@ -188,6 +196,25 @@ func ObserveRequestDuration(alias, provider string, d time.Duration) {
 // for a question SQL answers better.
 func AddCostCents(provider, model string, cents float64) {
 	costCentsTotal.WithLabelValues(provider, model).Add(cents)
+}
+
+// Cache lookup outcomes.
+const (
+	CacheHit   = "hit"
+	CacheMiss  = "miss"
+	CacheError = "error"
+)
+
+// RecordCacheLookup counts one cache consultation.
+//
+// Hits and misses share a counter rather than the hits-only counter the
+// design sketch called for, because the number anyone actually wants is
+// the hit *rate*, and a hits-only series cannot produce one — there is
+// no denominator. Errors are a third outcome rather than folded into
+// misses: both mean the request goes to the provider, but only one of
+// them means the cache is broken.
+func RecordCacheLookup(layer, result string) {
+	cacheLookups.WithLabelValues(layer, result).Inc()
 }
 
 // AddDroppedCostEvents records n cost events lost to a full buffer.
