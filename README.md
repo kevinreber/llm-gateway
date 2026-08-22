@@ -6,7 +6,7 @@ Built on the `net/http` standard library — no web framework.
 
 ## Status
 
-Working today: HTTP proxy to Anthropic and OpenAI, alias-based routing, per-alias distributed rate limiting, cost tracking, and resilience — per-provider circuit breaker, bounded retry with jittered backoff, and a declarative fallback chain. Caching and metrics are in progress — see [Roadmap](#roadmap).
+Working today: HTTP proxy to Anthropic and OpenAI, alias-based routing, per-alias distributed rate limiting, cost tracking, resilience — per-provider circuit breaker, bounded retry with jittered backoff, and a declarative fallback chain — plus Prometheus metrics and structured request-scoped logs. Caching, the admin API, and hot config reload are in progress — see [Roadmap](#roadmap).
 
 Not yet tagged for release. The HTTP surface may still change before `v0.1.0`.
 
@@ -135,7 +135,8 @@ Migrations in `migrations/` are embedded in the binary and applied at startup wh
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/messages` | Proxy a completion. Body matches the provider-agnostic `Request` shape. |
-| `GET` | `/healthz` | Liveness. Returns 200 while the process is serving. |
+| `GET` | `/healthz` | Readiness. 200 while serving, 503 once shutdown begins so a load balancer drains the instance before the listener closes. |
+| `GET` | `/metrics` | Prometheus exposition. Breaker gauges are read at scrape time, so they cannot drift from what the request path sees. |
 
 Every 200 response carries the routing headers:
 
@@ -148,7 +149,25 @@ Every 200 response carries the routing headers:
 
 A request that exhausts its chain returns the primary's own failure — the client asked for that alias, so why *it* could not be served is the answer to their question, and the other hops are in the log. So when the primary was refused by its own open circuit and no fallback served, the response is `503` with a `circuit_open` error type and a `Retry-After` computed from when that breaker will next admit a probe — even if a later hop failed some other way, since the primary's error is the one reported.
 
-`/metrics` and the admin API arrive with the observability work below.
+Every response also carries `X-Request-ID`, which is the identifier the request's log lines are tagged with. An inbound `X-Request-ID` is reused so one identifier spans the whole hop chain, provided it is printable ASCII and under 128 bytes; anything else is replaced with a generated ID rather than escaped, because the value reaches a response header where a bare CR or LF is response splitting and not a cosmetic problem.
+
+### Metrics
+
+| Metric | Type | Labels |
+|---|---|---|
+| `llm_gateway_requests_total` | counter | `alias`, `provider`, `result` |
+| `llm_gateway_request_duration_seconds` | histogram | `alias`, `provider` |
+| `llm_gateway_cost_cents_total` | counter | `provider`, `model` |
+| `llm_gateway_breaker_state` | gauge | `provider` |
+| `llm_gateway_provider_health` | gauge | `provider` |
+
+`result` is one of `ok`, `bad_request`, `rate_limited`, `circuit_open`, `provider_error`. `alias` and `provider` read `none` when a request carried neither, which happens for a direct model name and for a request rejected before routing.
+
+The latency histogram covers only requests that reached the provider phase. Requests refused at the door are counted by `llm_gateway_requests_total` instead — folding their microsecond-scale timings into a histogram measuring provider latency would produce percentiles describing neither population. A request refused by an open breaker *is* in the histogram, in the bottom bucket, because turning a slow failure into an immediate one is what the breaker is for and it should be visible.
+
+`llm_gateway_breaker_state` is `0` closed, `1` half-open, `2` open. `llm_gateway_provider_health` is the same fact for alerting: `1` when the gateway would currently admit a call, `0` when the circuit is open. It is derived from breaker state, not from an upstream probe, so scraping is free. Half-open counts as healthy — the breaker is admitting a probe, and paging on a provider that is recovering on its own is how an alert teaches people to ignore it.
+
+The admin API arrives with the rest of the observability work below.
 
 ## Development
 
@@ -176,7 +195,7 @@ Delivered:
 
 Planned:
 
-4. **Observability** — Prometheus metrics for request counts, latency, breaker state and cost totals; structured JSON logs; an admin API; hot config reload via `fsnotify` and an `atomic.Value` swap for a lock-free read path.
+4. **Observability** *(partly delivered)* — Prometheus metrics for request counts, latency, breaker state and cost totals, structured JSON logs keyed by request ID, and a shutdown-aware `/healthz` are in. Still to come: an admin API, and hot config reload via `fsnotify` and an `atomic.Value` swap for a lock-free read path.
 5. **Caching and remaining providers** — exact cache keyed on a SHA-256 of the canonicalized request, optional pgvector semantic cache behind it, plus Gemini and Ollama clients.
 6. **Deployment** — multi-stage distroless image, Fly.io config.
 
