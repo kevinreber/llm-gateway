@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kevinreber/llm-gateway/internal/config"
@@ -69,6 +70,13 @@ type Config struct {
 	// cost batches instead of persisting them, which keeps local
 	// development useful without standing up Postgres.
 	DatabaseURL string
+	// Logger receives structured operational events. Nil defaults to a
+	// slog JSON handler on stderr — JSON rather than text because these
+	// lines are meant to be queried by field (request_id, provider,
+	// alias) in a log backend, and a format that has to be regex-parsed
+	// to answer "show me this request" is the one that gets abandoned
+	// during an incident.
+	Logger *slog.Logger
 }
 
 // LoadConfigFromEnv reads Config from environment variables. Called by
@@ -84,6 +92,7 @@ func LoadConfigFromEnv() (Config, error) {
 		ConfigPath:       os.Getenv("CONFIG_PATH"),
 		BucketdAddrs:     splitList(os.Getenv("BUCKETD_ADDRS")),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		Logger:           slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 	}
 	// One key is enough to boot. Requiring Anthropic specifically made
 	// sense when it was the only provider; now it would refuse to start
@@ -106,7 +115,10 @@ func LoadConfigFromEnv() (Config, error) {
 // during the drain still get their rows, then close the database and
 // limiter connections the writer was using.
 func Run(ctx context.Context, cfg Config) error {
-	logger := slog.Default()
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
 
 	gwCfg, err := loadGatewayConfig(cfg.ConfigPath, logger)
 	if err != nil {
@@ -145,6 +157,12 @@ func Run(ctx context.Context, cfg Config) error {
 	if len(providers) == 0 {
 		return errors.New("no providers configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY")
 	}
+	// serving gates /healthz. It starts at 1 and is flipped to 0 at the
+	// top of the shutdown path, so the drain window doubles as the
+	// window in which a load balancer notices and stops sending work.
+	var serving atomic.Int32
+	serving.Store(1)
+
 	h := &handler{
 		providers:     providers,
 		providerOrder: order,
@@ -153,6 +171,7 @@ func Run(ctx context.Context, cfg Config) error {
 		costs:         writer,
 		logger:        logger,
 		callBudget:    defaultCallBudget,
+		serving:       &serving,
 	}
 	warnUnroutable(gwCfg, providers, logger)
 
@@ -193,6 +212,10 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	case <-ctx.Done():
 		logger.Info("gateway shutting down", "timeout", cfg.ShutdownTimeout)
+		// Before Shutdown, not after: once Shutdown closes the listener,
+		// a health check that still said 200 has sent the load balancer
+		// traffic that now gets refused at the TCP level.
+		serving.Store(0)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
