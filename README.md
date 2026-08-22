@@ -160,6 +160,7 @@ Every response also carries `X-Request-ID`, which is the identifier the request'
 | `llm_gateway_cost_cents_total` | counter | `provider`, `model` |
 | `llm_gateway_breaker_state` | gauge | `provider` |
 | `llm_gateway_provider_health` | gauge | `provider` |
+| `llm_gateway_cost_events_dropped_total` | counter | — |
 
 `result` is one of `ok`, `bad_request`, `rate_limited`, `circuit_open`, `upstream_rejected`, `provider_error`. The last two are deliberately distinct: `upstream_rejected` is the provider declining one request on its own terms (a malformed prompt, a 429), while `provider_error` is the provider itself failing. Folding them together would make the obvious alert — rate of `provider_error` — page somebody because one caller is sending bad prompts. It is the same line `internal/resilience` already draws when it decides a 400 must not count toward opening a circuit. `alias` and `provider` read `none` when a request carried neither, which happens for a direct model name and for a request rejected before routing.
 
@@ -168,6 +169,10 @@ Every label value is drawn from a finite set the gateway controls. `model` in pa
 The latency histogram covers only requests that reached the provider phase. Requests refused at the door are counted by `llm_gateway_requests_total` instead — folding their microsecond-scale timings into a histogram measuring provider latency would produce percentiles describing neither population. A request refused by an open breaker *is* in the histogram, in the bottom bucket, because turning a slow failure into an immediate one is what the breaker is for and it should be visible.
 
 `llm_gateway_breaker_state` is `0` closed, `1` half-open, `2` open. `llm_gateway_provider_health` is the same fact for alerting: `1` when the gateway would currently admit a call, `0` when the circuit is open. It is derived from breaker state, not from an upstream probe, so scraping is free. Half-open counts as healthy — the breaker is admitting a probe, and paging on a provider that is recovering on its own is how an alert teaches people to ignore it.
+
+`llm_gateway_cost_events_dropped_total` is the one number worth alerting on unconditionally. The cost writer drops rather than blocks when its buffer fills, which is the right trade — a slow Postgres must not become the gateway's latency — but any non-zero rate means recorded spend is an undercount, and that is something to learn from a dashboard rather than from a finance question three weeks later.
+
+`/metrics` is served on the same listener as `/v1/messages`, so it is reachable by anyone who can reach the gateway. It discloses cumulative spend, which upstream vendors are wired, and which of them are currently failing. Put the gateway behind a network boundary, or wait for the admin API work below, which moves the operational surface to its own port.
 
 The admin API arrives with the rest of the observability work below.
 

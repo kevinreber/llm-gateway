@@ -465,3 +465,48 @@ func TestMetrics_SeparatesUpstreamRefusalsFromProviderFailures(t *testing.T) {
 		})
 	}
 }
+
+// droppingTracker reports a drop count the way cost.Writer does, so the
+// scrape path can be tested without standing up the real writer.
+type droppingTracker struct {
+	recordingTracker
+	dropped atomic.Int64
+}
+
+func (d *droppingTracker) Dropped() int64 { return d.dropped.Load() }
+
+func TestMetrics_PublishesDroppedCostEvents(t *testing.T) {
+	// The writer exposes a running total and a Prometheus counter only
+	// moves by addition, so the scrape publishes the delta. Getting that
+	// wrong in either direction is silent: re-adding the total on every scrape
+	// inflates it without bound, and never adding leaves the one place
+	// this system knowingly loses data invisible.
+	hn := newFallbackHarness(t, noRetry())
+	tr := &droppingTracker{}
+	hn.h.costs = tr
+
+	const series = "llm_gateway_cost_events_dropped_total"
+	before := seriesValue(t, scrape(t, hn.h), series)
+
+	tr.dropped.Store(3)
+	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 3 {
+		t.Fatalf("after 3 drops: delta = %v, want 3", got)
+	}
+
+	// A scrape that sees no new drops must not re-publish the old ones.
+	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 3 {
+		t.Errorf("idle scrape: delta = %v, want 3", got)
+	}
+
+	tr.dropped.Store(5)
+	if got := seriesValue(t, scrape(t, hn.h), series) - before; got != 5 {
+		t.Errorf("after 2 more drops: delta = %v, want 5", got)
+	}
+}
+
+func TestMetrics_TrackerWithoutDropReportingIsSkipped(t *testing.T) {
+	// cost.Discard and the plain recording tracker have no drop count.
+	// Scraping must not panic on the missing method.
+	hn := newFallbackHarness(t, noRetry())
+	scrape(t, hn.h)
+}

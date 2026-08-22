@@ -71,6 +71,11 @@ type handler struct {
 	// "always serving", which is what a handler constructed directly in
 	// a unit test gets.
 	serving *atomic.Int32
+	// publishedDrops is the cost-writer drop count already reflected in
+	// the metrics counter. The writer exposes a running total, and a
+	// Prometheus counter only moves by addition, so the scrape publishes
+	// the delta since it last looked.
+	publishedDrops atomic.Int64
 }
 
 // requestObs accumulates the metric labels for one request.
@@ -149,6 +154,7 @@ func (h *handler) metrics() http.Handler {
 	prom := promhttp.Handler()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.refreshBreakerGauges()
+		h.refreshCostDrops()
 		prom.ServeHTTP(w, r)
 	})
 }
@@ -168,6 +174,33 @@ func (h *handler) refreshBreakerGauges() {
 			continue
 		}
 		observe.SetBreakerState(name, breakerGaugeValue(b.Breaker().State()))
+	}
+}
+
+// refreshCostDrops publishes cost events the writer has dropped since
+// the last scrape.
+//
+// The CAS loop rather than a plain swap is what keeps the counter exact
+// under concurrent scrapes: two scrapes reading different totals could
+// otherwise publish overlapping deltas and inflate the count. Prometheus
+// serializes scrapes of one target in practice, so this is guarding
+// against a second scraper rather than a likely race — but a counter
+// that is only correct when nobody else is looking is not a counter.
+func (h *handler) refreshCostDrops() {
+	d, ok := h.costs.(interface{ Dropped() int64 })
+	if !ok {
+		return
+	}
+	total := d.Dropped()
+	for {
+		prev := h.publishedDrops.Load()
+		if total <= prev {
+			return
+		}
+		if h.publishedDrops.CompareAndSwap(prev, total) {
+			observe.AddDroppedCostEvents(float64(total - prev))
+			return
+		}
 	}
 }
 

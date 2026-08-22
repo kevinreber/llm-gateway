@@ -133,6 +133,14 @@ var (
 		[]string{"provider"},
 	)
 
+	costEventsDropped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "llm_gateway_cost_events_dropped_total",
+			Help: "Cost events discarded because the writer's buffer was full. " +
+				"Non-zero means recorded spend is an undercount.",
+		},
+	)
+
 	providerHealth = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "llm_gateway_provider_health",
@@ -180,6 +188,19 @@ func ObserveRequestDuration(alias, provider string, d time.Duration) {
 // for a question SQL answers better.
 func AddCostCents(provider, model string, cents float64) {
 	costCentsTotal.WithLabelValues(provider, model).Add(cents)
+}
+
+// AddDroppedCostEvents records n cost events lost to a full buffer.
+//
+// The writer drops rather than blocks, which is the right trade — a
+// slow Postgres must not become the gateway's latency — but it means
+// the one place this system knowingly loses data had no signal on
+// /metrics, only a line in a log nobody reads until afterwards. Any
+// non-zero rate here says recorded spend is an undercount, which is the
+// kind of thing you want to learn from a dashboard and not from a
+// finance question three weeks later.
+func AddDroppedCostEvents(n float64) {
+	costEventsDropped.Add(n)
 }
 
 // SetBreakerState publishes a provider's breaker state and the health
