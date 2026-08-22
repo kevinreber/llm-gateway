@@ -69,6 +69,11 @@ type Config struct {
 	RateLimits map[string]Limit   `yaml:"ratelimits"`
 	Breakers   map[string]Breaker `yaml:"breakers"`
 
+	// Cache maps an alias to its response-cache policy. An alias absent
+	// from this table is not cached, which is the safe default: caching
+	// changes what a caller gets back, so it has to be asked for.
+	Cache map[string]CachePolicy `yaml:"cache"`
+
 	// Fallback maps an alias to the ordered list of aliases to try when
 	// it cannot be served.
 	//
@@ -171,6 +176,16 @@ func (c *Config) Validate() error {
 		}
 		if b.RecoveryTimeout <= 0 {
 			return fmt.Errorf("breaker %q: recovery_timeout must be > 0", name)
+		}
+	}
+
+	for _, name := range sortedKeys(c.Cache) {
+		// Same reasoning as ratelimits: a cache policy naming an alias
+		// that does not exist is dead config, and silently not caching
+		// is the worst way to discover the typo — the gateway would look
+		// like it was working and just be slower and more expensive.
+		if _, ok := c.Aliases[name]; !ok {
+			return fmt.Errorf("cache %q: no alias with that name", name)
 		}
 	}
 

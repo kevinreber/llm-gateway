@@ -125,6 +125,7 @@ A breaker entry naming a provider this build has no key for is ignored with a st
 | `CONFIG_WATCH` | `on` | Reload `gateway.yaml` automatically when it changes on disk. Set to `off` to require an explicit `POST /admin/reload`. |
 | `CONFIG_PATH` | `gateway.yaml` | Alias config. A missing file at the default path is tolerated; a missing file at an explicitly configured path is a startup error. |
 | `BUCKETD_ADDRS` | — | Comma-separated bucketd nodes. Unset disables rate limiting. |
+| `REDIS_URL` | — | Response cache backend. Unset disables caching. A malformed URL is a startup error; an unreachable Redis is not, and degrades to a miss. |
 | `DATABASE_URL` | — | Postgres DSN for cost tracking. Unset logs cost batches instead of persisting them. |
 | `SHUTDOWN_TIMEOUT` | `15s` | How long to drain in-flight requests on SIGTERM. |
 | `ANTHROPIC_BASE_URL` | production | Override the upstream endpoint. Used by tests. |
@@ -185,6 +186,7 @@ Every response also carries `X-Request-ID`, which is the identifier the request'
 | `llm_gateway_cost_cents_total` | counter | `provider`, `model` |
 | `llm_gateway_breaker_state` | gauge | `provider` |
 | `llm_gateway_provider_health` | gauge | `provider` |
+| `llm_gateway_cache_lookups_total` | counter | `layer`, `result` |
 | `llm_gateway_cost_events_dropped_total` | counter | — |
 
 `result` is one of `ok`, `bad_request`, `rate_limited`, `circuit_open`, `upstream_rejected`, `provider_error`. The last two are deliberately distinct: `upstream_rejected` is the provider declining one request on its own terms (a malformed prompt, a 429), while `provider_error` is the provider itself failing. Folding them together would make the obvious alert — rate of `provider_error` — page somebody because one caller is sending bad prompts. It is the same line `internal/resilience` already draws when it decides a 400 must not count toward opening a circuit. `alias` and `provider` read `none` when a request carried neither, which happens for a direct model name and for a request rejected before routing.
@@ -195,9 +197,35 @@ The latency histogram covers only requests that reached the provider phase. Requ
 
 `llm_gateway_breaker_state` is `0` closed, `1` half-open, `2` open. `llm_gateway_provider_health` is the same fact for alerting: `1` when the gateway would currently admit a call, `0` when the circuit is open. It is derived from breaker state, not from an upstream probe, so scraping is free. Half-open counts as healthy — the breaker is admitting a probe, and paging on a provider that is recovering on its own is how an alert teaches people to ignore it.
 
+`llm_gateway_cache_lookups_total` counts hits and misses on one counter rather than hits alone, because the number anyone wants is the hit *rate* and a hits-only series has no denominator. `error` is a third outcome rather than folded into misses: both send the request to the provider, but only one means the cache is broken.
+
 `llm_gateway_cost_events_dropped_total` is the one number worth alerting on unconditionally. The cost writer drops rather than blocks when its buffer fills, which is the right trade — a slow Postgres must not become the gateway's latency — but any non-zero rate means recorded spend is an undercount, and that is something to learn from a dashboard rather than from a finance question three weeks later.
 
 `/admin/stats` reads its per-provider request counts back out of the metric registry rather than keeping a second tally, so it and `/metrics` cannot disagree. Two independent counts of the same events drift the moment one is updated on a path the other missed, and the version an operator sees during an incident is whichever one they happened to open.
+
+## Response caching
+
+Caching is opt-in per alias:
+
+```yaml
+aliases:
+  smart: { provider: anthropic, model: claude-sonnet-5 }
+
+cache:
+  smart: { ttl: 5m }
+```
+
+An alias with no entry is never cached. Caching changes what a caller gets back, so it has to be asked for, and an alias naming a nonexistent alias is a config error rather than a silent no-op — the gateway would otherwise look like it was working and just be slower and more expensive.
+
+The key is a SHA-256 over the *resolved* provider and model plus the system prompt, messages, `max_tokens`, and `temperature`. Hashing the parsed request rather than the client's bytes means two callers who differ only in JSON key order or whitespace share an entry. Message text itself is not normalized: collapsing whitespace inside a prompt would make two genuinely different inputs collide, and leading whitespace is load-bearing often enough in prompting that discarding it would be the cache changing the answer.
+
+Two consequences worth knowing before turning this on:
+
+**A hit returns a previous sample.** `temperature` is in the key, so a request at `temperature: 1.0` will not collide with one at `0`, but two identical high-temperature requests inside the TTL get the *same* completion rather than two samples. If you are relying on sampling variance, do not cache that alias.
+
+**A fallback's response is not stored under the primary's key.** Doing so would serve the stand-in to every later request for that alias until the entry expired, silently pinning traffic to it long after the primary recovered — and with no fallback header, since as far as those requests are concerned nothing failed. The cost is that the cache stops helping during an outage, which is the right side of that trade.
+
+A cache hit is not billed, and carries `X-Gateway-Cache: hit` alongside the usual routing headers. A cache failure of any kind — unreachable backend, corrupt entry, timeout — degrades to a miss and the request proceeds exactly as it would have with no cache at all.
 
 ## Development
 
@@ -226,7 +254,7 @@ Delivered:
 Planned:
 
 4. **Observability** — Prometheus metrics for request counts, latency, breaker state and cost totals; structured JSON logs keyed by request ID; a shutdown-aware `/healthz`; an admin API on its own listener; and hot config reload through a lock-free atomic swap, triggered either by `POST /admin/reload` or by an `fsnotify` watch on the config file.
-5. **Caching and remaining providers** — exact cache keyed on a SHA-256 of the canonicalized request, optional pgvector semantic cache behind it, plus Gemini and Ollama clients.
+5. **Caching and remaining providers** *(partly delivered)* — the exact cache keyed on a SHA-256 of the canonicalized request is in, backed by Redis and configured per alias. Still to come: an optional pgvector semantic cache behind it, plus Gemini and Ollama clients.
 6. **Deployment** — multi-stage distroless image, Fly.io config.
 
 ## License

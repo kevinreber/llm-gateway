@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kevinreber/llm-gateway/internal/admin"
+	"github.com/kevinreber/llm-gateway/internal/cache"
 	"github.com/kevinreber/llm-gateway/internal/config"
 	"github.com/kevinreber/llm-gateway/internal/cost"
 	"github.com/kevinreber/llm-gateway/internal/provider"
@@ -75,6 +76,10 @@ type Config struct {
 	// Prometheus exposition. Empty disables the listener entirely, which
 	// also removes /metrics — there is no second place it is served.
 	AdminAddr string
+	// RedisURL is the response cache backend. Empty disables caching
+	// entirely, which is a supported deployment: the gateway is a proxy
+	// first and a cache second.
+	RedisURL string
 	// DatabaseURL is the Postgres DSN for cost tracking. Empty logs
 	// cost batches instead of persisting them, which keeps local
 	// development useful without standing up Postgres.
@@ -102,6 +107,7 @@ func LoadConfigFromEnv() (Config, error) {
 		OpenAIBaseURL:    os.Getenv("OPENAI_BASE_URL"),
 		ConfigPath:       os.Getenv("CONFIG_PATH"),
 		BucketdAddrs:     splitList(os.Getenv("BUCKETD_ADDRS")),
+		RedisURL:         os.Getenv("REDIS_URL"),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
 		Logger:           slog.New(slog.NewJSONHandler(os.Stderr, nil)),
 	}
@@ -171,6 +177,12 @@ func Run(ctx context.Context, cfg Config) error {
 	// reports there is nothing to re-read.
 	store := config.NewStore(configPath, gwCfg)
 
+	responseCache, err := buildCache(cfg.RedisURL, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = responseCache.Close() }()
+
 	providers, order := buildProviders(cfg, gwCfg, logger)
 	if len(providers) == 0 {
 		return errors.New("no providers configured: set ANTHROPIC_API_KEY or OPENAI_API_KEY")
@@ -187,6 +199,7 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg:           store,
 		limiter:       limiter,
 		costs:         writer,
+		cache:         responseCache,
 		logger:        logger,
 		callBudget:    defaultCallBudget,
 		serving:       &serving,
@@ -396,6 +409,28 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// buildCache returns the response cache. A malformed REDIS_URL is a
+// startup error rather than a silent downgrade to no caching: the
+// operator asked for a cache, and a gateway that quietly serves every
+// request from the provider looks identical to a working one except on
+// the invoice.
+//
+// An *unreachable* Redis is a different matter and is not checked here.
+// That degrades per operation to a miss, which is correct for a cache
+// and the reason NewRedis does not ping.
+func buildCache(url string, logger *slog.Logger) (cache.Cache, error) {
+	if url == "" {
+		logger.Info("REDIS_URL unset; response caching disabled")
+		return cache.Disabled{}, nil
+	}
+	c, err := cache.NewRedis(url)
+	if err != nil {
+		return nil, fmt.Errorf("response cache: %w", err)
+	}
+	logger.Info("response caching enabled")
+	return c, nil
 }
 
 func buildLimiter(addrs []string, logger *slog.Logger) (ratelimit.Limiter, error) {

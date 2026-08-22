@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kevinreber/llm-gateway/internal/cache"
 	"github.com/kevinreber/llm-gateway/internal/config"
 	"github.com/kevinreber/llm-gateway/internal/cost"
 	"github.com/kevinreber/llm-gateway/internal/observe"
@@ -62,7 +63,11 @@ type handler struct {
 	cfg     *config.Store
 	limiter ratelimit.Limiter
 	costs   cost.Tracker
-	logger  *slog.Logger
+	// cache deflects an identical repeat request before it reaches a
+	// provider. Nil means no cache, the same thing cache.Disabled means,
+	// which saves every test constructing one it does not use.
+	cache  cache.Cache
+	logger *slog.Logger
 	// callBudget overrides defaultCallBudget. Zero means "no budget of
 	// our own", which leaves the request bounded by the client's context
 	// and the per-provider budgets rather than by nothing.
@@ -196,9 +201,23 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	callCtx, cancel := h.withCallBudget(r.Context())
 	defer cancel()
 
-	// Routed and admitted: from here the elapsed time is provider time,
-	// which is what the latency histogram is for.
+	// Routed and admitted: from here the elapsed time is what the client
+	// experiences for a request the gateway agreed to serve, which is
+	// what the latency histogram is for. A cache hit belongs in it —
+	// unlike a refusal, it is a served request, and watching the
+	// distribution go bimodal as hit rate climbs is the point.
 	obs.reached = true
+
+	cacheKey, ttl, cacheable := h.cachePolicy(conf, rt, &req)
+	if cacheable {
+		if cached, ok := h.cacheGet(callCtx, cacheKey); ok {
+			obs.result = observe.ResultOK
+			w.Header().Set("X-Gateway-Cache", "hit")
+			h.writeRouteHeaders(w, rt)
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+	}
 
 	served, resp, err := h.call(callCtx, conf, rt, &req)
 	if err != nil {
@@ -213,21 +232,94 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	obs.result = observe.ResultOK
 
 	h.trackCost(r.Context(), served, resp)
-
-	// Tell the client what actually served the request. Without this an
-	// alias is a black box — you can't tell `smart` routed to Anthropic
-	// from `smart` falling back to OpenAI by reading the body. These
-	// describe the route that produced this response, not the one the
-	// client asked for, which is the whole reason they are worth having.
-	w.Header().Set("X-Gateway-Provider", served.provider.Name())
-	w.Header().Set("X-Gateway-Model", served.model)
-	if served.alias != "" {
-		w.Header().Set("X-Gateway-Alias", served.alias)
+	if cacheable {
+		h.cacheSet(r.Context(), served, &req, resp, ttl)
+		w.Header().Set("X-Gateway-Cache", "miss")
 	}
-	if served.via != "" {
-		w.Header().Set("X-Gateway-Fallback", served.via)
-	}
+	h.writeRouteHeaders(w, served)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// writeRouteHeaders tells the client what actually served the request.
+// Without them an alias is a black box — you cannot tell `smart` routed
+// to Anthropic from `smart` falling back to OpenAI by reading the body.
+// These describe the route that produced this response, not the one the
+// client asked for, which is the whole reason they are worth having.
+func (h *handler) writeRouteHeaders(w http.ResponseWriter, rt route) {
+	w.Header().Set("X-Gateway-Provider", rt.provider.Name())
+	w.Header().Set("X-Gateway-Model", rt.model)
+	if rt.alias != "" {
+		w.Header().Set("X-Gateway-Alias", rt.alias)
+	}
+	if rt.via != "" {
+		w.Header().Set("X-Gateway-Fallback", rt.via)
+	}
+}
+
+// cachePolicy reports whether this request may be cached, and under
+// what key and TTL.
+//
+// Only aliases are cacheable. A caller naming a concrete model has
+// asked for that model specifically, and the config has nowhere to say
+// how long its answers stay fresh — the same reasoning that keeps rate
+// limits attached to aliases.
+func (h *handler) cachePolicy(conf *config.Config, rt route, req *provider.Request) (string, time.Duration, bool) {
+	if h.cache == nil || rt.alias == "" {
+		return "", 0, false
+	}
+	policy, ok := conf.CacheFor(rt.alias)
+	if !ok {
+		return "", 0, false
+	}
+	return cache.Key(rt.provider.Name(), rt.model, req), policy.TTL.Std(), true
+}
+
+// cacheGet consults the cache, treating any failure as a miss.
+//
+// A cache exists to make requests cheaper, so it must never make one
+// fail: an unreachable Redis costs the lookup timeout and then the
+// request proceeds exactly as it would have with no cache at all.
+func (h *handler) cacheGet(ctx context.Context, key string) (*provider.Response, bool) {
+	resp, hit, err := h.cache.Get(ctx, key)
+	switch {
+	case err != nil:
+		observe.RecordCacheLookup(cache.LayerExact, observe.CacheError)
+		h.log(ctx).Warn("cache lookup failed; calling the provider", "err", err)
+		return nil, false
+	case hit:
+		observe.RecordCacheLookup(cache.LayerExact, observe.CacheHit)
+		return resp, true
+	default:
+		observe.RecordCacheLookup(cache.LayerExact, observe.CacheMiss)
+		return nil, false
+	}
+}
+
+// cacheSet stores a completion under the key for the route that
+// actually served it.
+//
+// Keyed by the served route rather than the requested one, which
+// matters only when a fallback answered. Storing a fallback's response
+// under the primary's key would serve it to every later request for
+// that alias until the entry expired — silently pinning traffic to the
+// stand-in long after the primary recovered, and with no fallback
+// header, because as far as those requests are concerned nothing failed.
+//
+// The cost is that the cache stops helping during an outage, since the
+// lookup happens once, against the primary. That is the right side of
+// the trade: a cache that quietly changes which vendor answers is worse
+// than one that stops helping for a few minutes.
+func (h *handler) cacheSet(
+	ctx context.Context,
+	served route,
+	req *provider.Request,
+	resp *provider.Response,
+	ttl time.Duration,
+) {
+	key := cache.Key(served.provider.Name(), served.model, req)
+	if err := h.cache.Set(ctx, key, resp, ttl); err != nil {
+		h.log(ctx).Warn("cache store failed", "err", err)
+	}
 }
 
 // withCallBudget bounds the provider phase of a request.
