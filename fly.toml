@@ -1,0 +1,87 @@
+# Fly.io deployment config for llm-gateway.
+#
+# To deploy: install flyctl, run `fly launch --no-deploy` once to create
+# the app (this file stays the source of truth), then `fly deploy`.
+#
+# Before the first deploy, set whichever providers you want wired, plus
+# the backing stores:
+#
+#   fly secrets set ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...
+#   fly secrets set DATABASE_URL=postgres://... REDIS_URL=redis://...
+#
+# At least one provider is required or the process refuses to start.
+
+app = "llm-gateway"
+primary_region = "sjc" # Pacific-US
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ADDR = ":8080"
+  ADMIN_ADDR = ":8081"
+  SHUTDOWN_TIMEOUT = "15s"
+  CONFIG_WATCH = "on"
+  # Every credential is a secret, not an env entry. `fly secrets set`
+  # keeps them out of this file and out of git history.
+
+# ---- request path ----
+# The only publicly routed service. /v1/messages and /healthz.
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  # Not "stop". A cold start drops the in-memory breaker state and the
+  # buffered cost events that have not flushed yet, and it re-reads
+  # config on every wake. For a gateway whose whole job is absorbing
+  # provider failures on behalf of callers, forgetting which provider is
+  # currently failing is the wrong thing to trade for idle cost.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+    method = "get"
+    path = "/healthz"
+
+# ---- admin surface: deliberately NOT a [[services]] block ----
+#
+# There is no service for :8081, and that omission is the security
+# control. Fly publicly routes only the ports named in a [[services]]
+# block, so leaving the admin port out keeps it reachable on the private
+# 6PN network and nowhere else.
+#
+# That matters because POST /admin/reload repoints live traffic and
+# carries no authentication at all, and /metrics discloses cumulative
+# spend and which vendors are failing. Adding a [[services]] block for
+# :8081 would publish both to the internet.
+#
+# To reach it: `fly proxy 8081:8081` from a laptop, or hit
+# <app>.internal:8081 from another app in the same organization.
+
+# ---- Prometheus metrics ----
+# Fly's built-in scraper reaches instances over the private network, so
+# it can scrape the admin port without that port being published. This
+# is the whole reason the split works on Fly at all.
+[[metrics]]
+  port = 8081
+  path = "/metrics"
+
+# ---- Machine sizing ----
+[[vm]]
+  size = "shared-cpu-1x"
+  # The gateway holds little itself — the cost writer's buffer and one
+  # http.Client pool per provider. 512mb is headroom for connection
+  # pools to Postgres and Redis rather than for the gateway's own state.
+  memory = "512mb"

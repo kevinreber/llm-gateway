@@ -1,0 +1,15 @@
+# Everything the build does not need. Keeping the context small matters
+# more than usual here: .claude/worktrees holds full checkouts of the
+# repo, and shipping those into the build context would multiply its
+# size for nothing.
+.git
+.github
+.claude
+*.md
+!go.mod
+!go.sum
+bin/
+build/
+dist/
+*.out
+coverage.txt
