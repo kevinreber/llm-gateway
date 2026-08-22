@@ -227,6 +227,14 @@ Two consequences worth knowing before turning this on:
 
 A cache hit is not billed, and carries `X-Gateway-Cache: hit` alongside the usual routing headers. A cache failure of any kind — unreachable backend, corrupt entry, timeout — degrades to a miss and the request proceeds exactly as it would have with no cache at all.
 
+Three more properties to decide about before enabling it:
+
+**Rate limits are applied before the cache is consulted**, so a hit still costs a token. A hit consumes no upstream quota and no spend, so charging for it is arguably wasteful — but checking the cache first would let a client hammer cached entries for free, and the limit exists for client fairness as well as for cost.
+
+**Entries are shared across callers.** The key is derived from request content only; the gateway has no notion of caller identity. Two clients sending the same prompt to the same alias get the same completion, which is the entire point of a cache and also a reason not to enable it on an alias whose callers must not see each other's results.
+
+**There is no stampede protection.** N identical requests arriving together all miss, and all call the provider. The cache deflects the *second wave*, not the first. Collapsing them would need single-flight coordination, which is not in this version.
+
 ## Development
 
 ```bash

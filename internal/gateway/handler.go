@@ -208,6 +208,11 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	// distribution go bimodal as hit rate climbs is the point.
 	obs.reached = true
 
+	// Consulted after the rate limit, not before. A hit consumes no
+	// upstream quota and no spend, so charging a token for it is
+	// arguably waste — but checking the cache first would let a client
+	// hammer cached entries for free, and the limit is for client
+	// fairness as much as for cost.
 	cacheKey, ttl, cacheable := h.cachePolicy(conf, rt, &req)
 	if cacheable {
 		if cached, ok := h.cacheGet(callCtx, cacheKey); ok {
