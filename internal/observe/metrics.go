@@ -62,6 +62,16 @@ const (
 // bug every time somebody new looks at it.
 const LabelNone = "none"
 
+// ModelUnpriced is the model label for a completion whose model is not
+// in the pricing table.
+//
+// One shared bucket rather than the model's own name, because the name
+// in that case is an unrecognized string from the upstream and is
+// exactly the input that cannot be trusted to be one of finitely many.
+// The specific model is not lost — it is on the cost row and in the
+// warning this path logs.
+const ModelUnpriced = "unpriced"
+
 // Breaker state gauge values. Ordered by severity so that a dashboard
 // can alert on `max_over_time(llm_gateway_breaker_state[5m]) >= 2`
 // without a mapping table.

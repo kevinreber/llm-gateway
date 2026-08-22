@@ -503,12 +503,22 @@ func (h *handler) trackCost(ctx context.Context, rt route, resp *provider.Respon
 			"provider", rt.provider.Name(), "model", model)
 	}
 
-	// Added even when the price is unknown, which creates a series
-	// pinned at zero for that model. That is the intent: a model missing
-	// from the pricing table should be visible on the cost dashboard as
-	// serving traffic it cannot account for, rather than absent from it
-	// and indistinguishable from a model nobody called.
-	observe.AddCostCents(rt.provider.Name(), model, cents)
+	// Labelled by the pricing table's own ID rather than by the model
+	// string the upstream echoed. That string is provider-controlled, so
+	// using it directly would let a provider mint an unbounded number of
+	// permanent time series; the table is finite, so an ID drawn from it
+	// cannot.
+	//
+	// Recorded even when the price is unknown, which pins a series at
+	// zero under the shared unpriced label. That is the intent: traffic
+	// the gateway cannot account for should be visible on the cost
+	// dashboard rather than absent from it and indistinguishable from a
+	// model nobody called.
+	modelLabel := observe.ModelUnpriced
+	if known {
+		modelLabel, _ = cost.CanonicalModel(model)
+	}
+	observe.AddCostCents(rt.provider.Name(), modelLabel, cents)
 
 	h.costs.Track(cost.Event{
 		TS:           time.Now().UTC(),

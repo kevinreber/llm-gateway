@@ -144,22 +144,43 @@ var prices = map[string]Price{
 // the model is not in the table — callers should record a zero cost and
 // say so loudly rather than guessing at a rate.
 func PriceFor(model string) (Price, bool) {
-	if p, ok := prices[model]; ok {
-		return p, true
+	id, ok := CanonicalModel(model)
+	if !ok {
+		return Price{}, false
+	}
+	return prices[id], true
+}
+
+// CanonicalModel returns the pricing-table ID that model bills under,
+// collapsing a dated snapshot onto its family: both "gpt-4o" and
+// "gpt-4o-2024-08-06" answer "gpt-4o". The false return means the model
+// is not in the table.
+//
+// This exists to bound a metric label. The model recorded against a
+// completion is whatever the upstream echoed back, so labelling a
+// Prometheus series with that string directly hands cardinality control
+// to the provider — one new series for every distinct value it decides
+// to return, forever, because a counter series is never retired. The
+// pricing table is finite, so a label derived from it is too.
+//
+// Collapsing snapshots is not merely a cardinality tax either. Spend on
+// "gpt-4o" split across a series per release date is the wrong shape for
+// the question a cost dashboard is asked, which is what a model family
+// costs and not what each of its snapshots cost.
+func CanonicalModel(model string) (string, bool) {
+	if _, ok := prices[model]; ok {
+		return model, true
 	}
 	// Longest-prefix match so a dated snapshot bills at its family's
 	// rate. Longest wins because "claude-opus-4-8" and a hypothetical
 	// "claude-opus-4" would both prefix-match the same ID.
-	var (
-		best    Price
-		bestLen int
-	)
-	for id, p := range prices {
-		if len(id) > bestLen && hasModelPrefix(model, id) {
-			best, bestLen = p, len(id)
+	var best string
+	for id := range prices {
+		if len(id) > len(best) && hasModelPrefix(model, id) {
+			best = id
 		}
 	}
-	return best, bestLen > 0
+	return best, best != ""
 }
 
 // hasModelPrefix reports whether model is id or a dated snapshot of it.

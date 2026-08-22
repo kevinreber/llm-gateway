@@ -381,3 +381,53 @@ func TestRequestID_ReachesTheLogs(t *testing.T) {
 		t.Errorf("logs did not carry request_id %q:\n%s", id, buf.String())
 	}
 }
+
+func TestMetrics_CollapsesDatedSnapshotsOntoTheFamily(t *testing.T) {
+	// The model string on a cost row is whatever the upstream echoed
+	// back. Using it as a label directly would let a provider mint a
+	// permanent time series per value it returns, and counter series are
+	// never retired. Collapsing onto the pricing table also gives the
+	// dashboard the number it actually wants: what the family costs.
+	hn := newFallbackHarness(t, noRetry())
+	hn.anth.resp = &provider.Response{
+		Content: "ok",
+		Model:   "claude-sonnet-5-20251001",
+		Usage:   provider.Usage{InputTokens: 1000, OutputTokens: 500},
+	}
+
+	const family = `llm_gateway_cost_cents_total{model="claude-sonnet-5",provider="anthropic"}`
+	const snapshot = `llm_gateway_cost_cents_total{model="claude-sonnet-5-20251001",provider="anthropic"}`
+
+	before := seriesValue(t, scrape(t, hn.h), family)
+	hn.post(t, "smart")
+
+	body := scrape(t, hn.h)
+	if got := seriesValue(t, body, family) - before; got <= 0 {
+		t.Errorf("family series delta = %v, want > 0", got)
+	}
+	if strings.Contains(body, snapshot) {
+		t.Error("dated snapshot got its own series; the label is not bounded by the pricing table")
+	}
+}
+
+func TestMetrics_UnpricedModelsShareOneSeries(t *testing.T) {
+	// An unrecognized model name is exactly the input that cannot be
+	// trusted to be one of finitely many, so it goes in a shared bucket.
+	// The specific name survives on the cost row and in the warning log.
+	hn := newFallbackHarness(t, noRetry())
+	hn.anth.resp = &provider.Response{
+		Content: "ok",
+		Model:   "claude-experimental-does-not-exist",
+		Usage:   provider.Usage{InputTokens: 1000, OutputTokens: 500},
+	}
+
+	hn.post(t, "smart")
+
+	body := scrape(t, hn.h)
+	if !strings.Contains(body, `llm_gateway_cost_cents_total{model="unpriced",provider="anthropic"}`) {
+		t.Error("expected the unpriced bucket series")
+	}
+	if strings.Contains(body, `model="claude-experimental-does-not-exist"`) {
+		t.Error("unpriced model name leaked into a label")
+	}
+}
